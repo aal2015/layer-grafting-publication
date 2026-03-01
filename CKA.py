@@ -92,3 +92,99 @@ class CudaCKA(object):
         var1 = torch.sqrt(self.kernel_HSIC(X, X, sigma))
         var2 = torch.sqrt(self.kernel_HSIC(Y, Y, sigma))
         return hsic / (var1 * var2)
+
+from tqdm import tqdm
+
+class CKAEvaluator:
+    def __init__(self, device):
+        self.cuda_cka = CudaCKA(device)
+
+    def similarity_stats(self, cls_reps_similarity):
+        adj_similarities = []
+        for i in range(1, len(cls_reps_similarity)):
+            adj_similarities.append(cls_reps_similarity[i-1][i])
+    
+        argmax = int(np.argmax(adj_similarities))
+        argmin = int(np.argmin(adj_similarities))
+        
+        return {
+            'average': float(np.mean(adj_similarities)),
+            'max': float(adj_similarities[argmax]),
+            'argmax': argmax,
+            'min': float(adj_similarities[argmin]),
+            'argmin': argmin,
+            'adj_similarities': adj_similarities
+        }
+
+    def _extract_cls_token_embedding(self, hidden_states):
+        only_cls_embeddings = []
+        for hs in hidden_states:
+            cls_embedding = hs[:,0,:]
+            only_cls_embeddings.append(cls_embedding)
+            
+        return only_cls_embeddings
+    
+    def _pairwise_helper(self, sublayer_outs, only_cls_token=False, is_att = False):
+        if is_att:
+            sublayer_outs = flatten_atts(sublayer_outs)
+        elif only_cls_token:
+            sublayer_outs = self._extract_cls_token_embedding(sublayer_outs)
+            
+        # shape [batch_size, dim1 * .... * dim_n]
+        flattened_out_list = []
+        for sublayer_out in sublayer_outs:
+            flattened_out = torch.flatten(sublayer_out, start_dim=1)
+            flattened_out_list.append(flattened_out)
+        
+        layer_similarity  = []
+        layers_similarity = []
+        
+        for out_1 in flattened_out_list:
+            for out_2 in flattened_out_list:
+                cka_value = self.cuda_cka.linear_CKA(out_1, out_2)
+                layer_similarity.append(cka_value.detach().cpu())
+    
+            layers_similarity.append(np.array(layer_similarity))
+            layer_similarity = []
+        
+        return np.array(layers_similarity)
+
+    def pairwise(self, model, dataloader, device, only_cls_token=False, max_iter=float("Inf")):
+        model.set_use_module_grafting(False)
+        model.set_use_scc_status(False)
+        
+        n_batch = len(dataloader)
+        reps_similarity, atts_similarity = None, None
+    
+        progress_bar = tqdm(range(min(n_batch, max_iter)),desc="CKA Evaluation")
+        
+        model.eval()
+        for step, batch in enumerate(dataloader):
+            if step == max_iter:
+                break
+                
+            batch = {k: v.to(device) for k, v in batch.items()}
+            
+            # get model output
+            with torch.no_grad():
+                output = model(**batch)
+            loss = output.loss
+            reps = output.hidden_states['hidden_states'][1:] # omitting embedding output
+            # atts = output.attentions
+            
+            # similarity estimation
+            if reps_similarity is None:
+                reps_similarity = self._pairwise_helper(reps, only_cls_token)
+                # atts_similarity = CKA_pairwise_helper(atts, only_cls_token, is_att=True)
+            else:
+                reps_similarity += self._pairwise_helper(reps, only_cls_token)
+                # atts_similarity =+ CKA_pairwise_helper(atts, only_cls_token, is_att=True)
+            
+            progress_bar.update(1)
+                    
+        # averaging
+        reps_similarity = reps_similarity / n_batch
+        # atts_similarity = atts_similarity / n_batch
+        
+        # return reps_similarity, atts_similarity
+        return reps_similarity
