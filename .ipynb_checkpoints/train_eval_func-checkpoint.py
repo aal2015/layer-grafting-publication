@@ -101,11 +101,10 @@ def get_primary_metric(task_name):
     }
     return primary_metrics.get(task_name.lower(), 'accuracy')
 
-def train(model, train_dataloader, val_dataloader, task_name, device,
-          num_epochs=5, lr=3e-5, patience=3, threshold=0.1,
-          save_path=None, optimizer=None, lr_scheduler=None, 
-          use_early_stopping=False, display_epoch_iter=False,
-          benchmark="glue"):
+def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs=5, 
+          lr=3e-5, patience=3, threshold=0.1, save_path=None, optimizer=None, 
+          lr_scheduler=None, use_early_stopping=False, display_epoch_iter=False,
+          max_norm=0.05, benchmark="glue"):
     """
     Train BERT model with optional early stopping and checkpoint saving.
     Automatically handles all GLUE task metrics.
@@ -126,6 +125,7 @@ def train(model, train_dataloader, val_dataloader, task_name, device,
         lr_scheduler: Optional learning rate scheduler (default: None)
         use_early_stopping: Boolean to enable early stopping (default: False)
         display_epoch_iter: Boolean to display epoch iternation
+        max_norm: max norm of the gradients for torch gradient clipping
         benchmark: Benchmark name (default: "glue")
     
     Returns:
@@ -187,7 +187,7 @@ def train(model, train_dataloader, val_dataloader, task_name, device,
             # Backward pass
             total_loss += float(loss)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             
             optimizer.step()
             if use_scheduler:
@@ -293,14 +293,24 @@ def plotLossMulti(losses, legend, title=None):
     if title is not None:
         plt.title(title)
     
-def plotAccuracy(trainingAcc, valAcc, legend=["Training Accuracy", "Val Accuracy"], title=None):
+def plotAccuracy(trainingAcc, valAcc, legend=["Training Accuracy", "Val Accuracy"], title=None, xlabel=None, ylabel=None):
     plt.plot(trainingAcc)
     plt.plot(valAcc)
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy (%)")
+    
+    if xlabel != None:
+        plt.xlabel(xlabel)
+    else:
+        plt.xlabel("Epoch")
+
+    if ylabel != None:
+        plt.ylabel(ylabel)
+    else:
+        plt.ylabel("Accuracy (%)")
+    
     plt.legend(legend)
     if title is not None:
         plt.title(title)
+
         
 def plotLossMulti(accs, legend, title=None):
     for acc in accs:
