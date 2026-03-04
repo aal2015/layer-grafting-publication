@@ -13,28 +13,35 @@ def set_lr_scheduler(optimizer, num_training_steps, name = "linear", num_warmup_
 
 ####################### Training Loop #######################
 
-class EarlyStopping():
-    def __init__(self, patience = 3, threshold = 0.1):
-        self.patience      = patience
-        self.threshold     = threshold
-        self.min_val_loss = None
-        self.patienceCount = 0
-        
-    def _checkPatience(self,):
-        if self.patienceCount == self.patience:
-            return True
-        else:
-            self.patienceCount += 1
+class EarlyStopping:
+    def __init__(self, patience=3, threshold=0.0, mode="max"):
+        """
+        mode: "max" for accuracy/F1, "min" for loss
+        """
+        self.patience = patience
+        self.threshold = threshold
+        self.mode = mode
+        self.best_score = None
+        self.patience_count = 0
+
+    def _is_improvement(self, score):
+        if self.mode == "max":
+            return score > self.best_score + self.threshold
+        else:  # mode == "min"
+            return score < self.best_score - self.threshold
+
+    def check(self, score):
+        if self.best_score is None:
+            self.best_score = score
             return False
-    
-    def checkCondition(self, val_loss):
-        if self.min_val_loss == None:
-            self.min_val_loss = val_loss
-        elif val_loss - self.min_val_loss > self.threshold:
-            return self._checkPatience()
+
+        if self._is_improvement(score):
+            self.best_score = score
+            self.patience_count = 0
+            return False
         else:
-            self.patienceCount = 0
-        return False
+            self.patience_count += 1
+            return self.patience_count >= self.patience
 
 import evaluate
 import torch
@@ -54,12 +61,12 @@ import torch
         
 #     return metric.compute(), float(model_loss)
 
-def eval_loop(model, dataloader, dataset, device, benchmark="glue"):
+def eval_loop(model, dataloader, dataset, device, benchmark="glue", regression=False):
     metric = evaluate.load(benchmark, dataset)
     model.eval()
     
     total_loss = 0.0  # ← Accumulate
-    n_batches = 0     # ← Count
+    n_batches = 0     # ← Count 
     
     for batch in dataloader:
         batch = {k: v.to(device) for k, v in batch.items()}
@@ -68,7 +75,13 @@ def eval_loop(model, dataloader, dataset, device, benchmark="glue"):
         
         loss = outputs.loss
         logits = outputs.logits
-        predictions = torch.argmax(logits, dim=-1)
+
+        if regression:
+            # STS-B
+            predictions = logits.squeeze(-1)
+        else:
+            # MRPC, QNLI, CoLA, SST-2
+            predictions = torch.argmax(logits, dim=-1)
         
         metric.add_batch(predictions=predictions, references=batch["labels"])
         total_loss += float(loss)  # ← Add to total
@@ -102,9 +115,9 @@ def get_primary_metric(task_name):
     return primary_metrics.get(task_name.lower(), 'accuracy')
 
 def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs=5, 
-          lr=3e-5, patience=3, threshold=0.1, save_path=None, optimizer=None, 
+          lr=3e-5, patience=3, threshold=0.0, save_path=None, optimizer=None, 
           lr_scheduler=None, use_early_stopping=False, display_epoch_iter=False,
-          max_norm=0.05, benchmark="glue"):
+          max_norm=0.05, benchmark="glue", regression=False):
     """
     Train BERT model with optional early stopping and checkpoint saving.
     Automatically handles all GLUE task metrics.
@@ -127,6 +140,7 @@ def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs
         display_epoch_iter: Boolean to display epoch iternation
         max_norm: max norm of the gradients for torch gradient clipping
         benchmark: Benchmark name (default: "glue")
+        regression: is task classification or regression
     
     Returns:
         Dictionary with training history
@@ -143,7 +157,7 @@ def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs
     n_batches = len(train_dataloader)
 
     # Early stopping (if use_early_stopping is True)
-    if use_early_stopping:
+    if use_early_stopping:    
         early_stopping = EarlyStopping(patience=patience, threshold=threshold)
     
     # History tracking
@@ -154,7 +168,8 @@ def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs
     time_per_epoch_hist = []
     
     # Best model tracking (for optional saving)
-    val_old_loss = float("Inf")
+    primary_metric = get_primary_metric(task_name)
+    best_metric_score = float('-inf')
     
     # Training loop
     train_start = time.time()
@@ -178,10 +193,14 @@ def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs
             logits = outputs.logits
             
             # Compute predictions
-            predictions = torch.argmax(logits, dim=-1)
+            if regression:
+                predictions = logits.squeeze(-1)
+            else:
+                predictions = torch.argmax(logits, dim=-1)
+                
             train_metric.add_batch(
-                predictions=predictions,
-                references=batch["labels"]
+                predictions=predictions.detach().cpu(),
+                references=batch["labels"].detach().cpu()
             )
             
             # Backward pass
@@ -201,7 +220,7 @@ def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs
         
         # Validation
         val_metrics, val_loss = eval_loop(
-            model, val_dataloader, task_name, device, benchmark
+            model, val_dataloader, task_name, device, benchmark, regression=regression
         )
         
         # Store history
@@ -214,8 +233,9 @@ def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs
         time_per_epoch_hist.append(epoch_time)
         
         # Save checkpoint if path provided and loss improved
-        if save_path is not None and val_loss < val_old_loss:
-            val_old_loss = val_loss
+        current_metric_score = val_metrics[primary_metric]
+        if save_path is not None and current_metric_score > best_metric_score:
+            best_metric_score = current_metric_score
             
             save_object = {
                 'epoch': epoch + 1,
@@ -249,14 +269,15 @@ def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs
         
         # Early stopping check (if use_early_stopping is True)
         if use_early_stopping:
-            if early_stopping.checkCondition(val_loss):
+            if early_stopping.check(val_metrics[primary_metric ]):
                 print(">>>>> Early stopping callback <<<<<")
                 break
     
     total_train_time = time.time() - train_start
     print(f"\nTotal Training Time: {total_train_time:.2f} sec")
     if save_path is not None:
-        print(f"Best validation loss: {val_old_loss:.4f}")
+        print(f"Chosen Primary Metric: {primary_metric}")
+        print(f"Best Metric Run: {best_metric_score:.4f}")
     
     # Return training history
     return {
@@ -266,7 +287,8 @@ def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs
         'val_metrics_history': val_metrics_history,
         'time_per_epoch': time_per_epoch_hist,
         'total_time': total_train_time,
-        'best_val_loss': val_old_loss,
+        'best_metric': primary_metric,
+        'best_metric_score': best_metric_score,
         'num_epochs_trained': len(train_losses)
     }
     
