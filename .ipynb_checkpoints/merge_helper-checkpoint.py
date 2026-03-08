@@ -229,3 +229,75 @@ class LayerMergeTracker:
     
     def __len__(self):
         return len(self.layer_groups)
+
+
+def apply_layer_tracking_to_model(model, layer_track):
+    """
+    Apply a layer tracking configuration to a model.
+    
+    This is the function you should use in your notebook.
+    
+    Args:
+        model: Fresh copy of the original 12-layer BERT model
+        layer_track: Layer tracking list, e.g., [[0], [1,2], [3], [4,5,6], ...]
+    
+    Returns:
+        Model with merged layers according to layer_track
+    
+    Usage in your notebook:
+        # Load the saved tracking
+        checkpoint = torch.load('bert-mrpc-tracking.pt')
+        layer_track = checkpoint['layer_track']
+        
+        # Create fresh model
+        graft_model = BertForSequenceClassification.from_pretrained(
+            "bert-base-uncased",
+            num_labels=num_labels,
+            ...
+        )
+        
+        # Apply the merge pattern
+        graft_model = apply_layer_tracking_to_model(graft_model, layer_track)
+        
+        # Load the trained weights
+        graft_model.load_state_dict(checkpoint['model_state_dict'])
+    """
+    # Save original layers
+    original_layers = [deepcopy(layer) for layer in model.bert.encoder.layer]
+    
+    new_layers = []
+    
+    for group in layer_track:
+        if len(group) == 1:
+            # No merge - use original layer
+            idx = group[0]
+            new_layers.append(original_layers[idx])
+        
+        else:
+            # Need to merge - start with first layer
+            # Create a small temporary model for merging
+            temp_model = deepcopy(model)
+            temp_model.bert.encoder.layer = nn.ModuleList([
+                deepcopy(original_layers[group[0]])
+            ])
+            
+            # Iteratively merge in remaining layers
+            for i in range(1, len(group)):
+                next_layer = deepcopy(original_layers[group[i]])
+                temp_model.bert.encoder.layer.append(next_layer)
+                
+                # Merge the last two layers (indices len-2 and len-1)
+                last_idx = len(temp_model.bert.encoder.layer) - 2
+                merged = merge_bert_layers(temp_model, last_idx, last_idx + 1)
+                
+                # Replace with merged layer
+                temp_model.bert.encoder.layer = nn.ModuleList(
+                    list(temp_model.bert.encoder.layer[:last_idx]) + [merged]
+                )
+            
+            new_layers.append(temp_model.bert.encoder.layer[0])
+    
+    # Replace model's layers
+    model.bert.encoder.layer = nn.ModuleList(new_layers)
+    
+    return model

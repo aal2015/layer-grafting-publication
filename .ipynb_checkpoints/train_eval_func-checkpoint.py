@@ -291,7 +291,227 @@ def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs
         'best_metric_score': best_metric_score,
         'num_epochs_trained': len(train_losses)
     }
+
+import os
+from merge_helper import merge_bert_layers
+
+def get_recovery_epoch(task_name):
+    small_datasets = ['mrpc', 'cola', 'stsb', 'rte', 'wnli']
+    large_datasets = ['qqp', 'qnli', 'sst2', 'mnli']
+
+    if task_name in small_datasets:
+        return 3
+    elif task_name in large_datasets:
+        return 1
+
+def iterative_cka_merge_and_train(
+    model,
+    train_dataloader,
+    val_dataloader,
+    task_name,
+    device,
+    cka_evaluator,
+    tracker,
+    init_metric,
+    num_merges=6,
+    target_layers=[6, 7, 8],
+    recovery_epochs=3,
+    recovery_lr=1e-5,
+    patience=2,
+    save_dir='./weights/',
+    keep_temp_checkpoints=False,
+    cka_max_iter=float("Inf")
+):
+    """
+    Iteratively merge BERT layers using CKA similarity and recover performance.
     
+    Args:
+        model: BERT model to merge
+        train_dataloader: Training dataloader
+        val_dataloader: Validation dataloader
+        task_name: GLUE task name (e.g., "mrpc", "qnli", "sst2")
+        device: torch device
+        cka_evaluator: CKAEvaluator instance
+        tracker: LayerMergeTracker instance
+        init_metric: Initial metrics dict before any merging
+        num_merges: Number of merge iterations (default: 6)
+        target_layers: Layer counts to save checkpoints for (default: [6, 7, 8])
+        recovery_epochs: Epochs for recovery training (default: 3)
+        recovery_lr: Learning rate for recovery (default: 1e-5)
+        patience: Early stopping patience (default: 2)
+        save_dir: Directory to save final models (default: './weights/')
+        keep_temp_checkpoints: Keep temporary recovery checkpoints (default: False)
+    
+    Returns:
+        Dictionary with merge history
+    """
+    # Setup
+    orig_n_layer = len(model.bert.encoder.layer)
+    target_metric = get_primary_metric(task_name)
+    threshold = init_metric[target_metric] * 0.01
+    
+    # Create recovery checkpoint directory
+    recovery_dir = os.path.join(save_dir, 'recovery')
+    os.makedirs(recovery_dir, exist_ok=True)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    print(f"Target Metric for {task_name}: {target_metric}")
+    print(f"Original {target_metric} score: {init_metric[target_metric]:.4f}")
+    print(f"Recovery threshold: {threshold:.4f}")
+    print("")
+    
+    # History tracking
+    merge_history = {
+        'iterations': [],
+        'layer_compositions': [],
+        'metrics_after_merge': [],
+        'metrics_after_recovery': [],
+        'training_stats': []
+    }
+    
+    # Merge loop
+    for merge_itr in range(num_merges):
+        print("=" * 70)
+        print(f"Merge Iteration: {merge_itr + 1}/{num_merges}")
+        print("=" * 70)
+        
+        # Layer Similarity Estimation
+        print("\n[1/5] Computing CKA Similarity...")
+        cls_reps_similarity = cka_evaluator.pairwise(
+            model, 
+            train_dataloader, 
+            device, 
+            only_cls_token=True, 
+            max_iter=cka_max_iter
+        )
+        stats = cka_evaluator.similarity_stats(cls_reps_similarity)
+        
+        print("  Similarity Stats:")
+        print(f"    Average: {stats['average']:.6f}")
+        print(f"    Highest: {stats['max']:.6f}")
+        print(f"    Lowest:  {stats['min']:.6f}")
+        
+        # Merge Most Adjacent Similar Layer Pair
+        print("\n[2/5] Merging Layers...")
+        merge_layer = stats['argmax']
+        merged = merge_bert_layers(model, merge_layer, merge_layer + 1)
+        model.bert.encoder.layer[merge_layer] = merged
+        del model.bert.encoder.layer[merge_layer + 1]
+        
+        tracker.merge(merge_layer)
+        print(f"  Merged Layers: {merge_layer} + {merge_layer + 1}")
+        print(f"  Layer Composition: {tracker.get_mapping()}")
+        print(f"  Total Layers: {len(tracker)}")
+        
+        # Evaluate Impacted Performance
+        print("\n[3/5] Evaluating Post-Merge Performance...")
+        eval_metric = eval_loop(model, val_dataloader, task_name, device)[0]
+        print("  Metrics:")
+        for metric_name, value in eval_metric.items():
+            marker = "★" if metric_name == target_metric else " "
+            print(f"    {marker} {metric_name}: {value:.4f}")
+        
+        merge_history['metrics_after_merge'].append(eval_metric)
+        
+        # Recovery Training
+        print("\n[4/5] Recovery Training...")
+        diff = init_metric[target_metric] - eval_metric[target_metric]
+        print(f"  Performance drop: {diff:.4f} (threshold: {threshold:.4f})")
+        
+        if diff > threshold:
+            print("  → Recovery training NEEDED")
+            
+            # Setup optimizer and scheduler
+            optimizer = AdamW(model.parameters(), lr=recovery_lr)
+            num_training_steps = recovery_epochs * len(train_dataloader)
+            lr_scheduler = set_lr_scheduler(
+                optimizer=optimizer,
+                num_training_steps=num_training_steps
+            )
+            
+            print(f"  → Training: {recovery_epochs} epochs, lr={recovery_lr}")
+            
+            # Temporary checkpoint path
+            temp_save_path = os.path.join(recovery_dir, f'temp_iter{merge_itr}.pt')
+            
+            # Train with checkpoint saving
+            train_stats = train(
+                model,
+                train_dataloader,
+                val_dataloader,
+                task_name,
+                device,
+                num_epochs=recovery_epochs,
+                lr=recovery_lr,
+                patience=patience,
+                use_early_stopping=True,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                save_path=temp_save_path,
+                display_epoch_iter=True
+            )
+            
+            # CRITICAL: Reload best checkpoint
+            print("\n  → Loading best checkpoint...")
+            best_checkpoint = torch.load(temp_save_path)
+            model.load_state_dict(best_checkpoint['model_state_dict'])
+            
+            print(f"  ✓ Loaded best checkpoint from epoch {best_checkpoint['epoch']}")
+            print(f"    Best val loss: {best_checkpoint['val_loss']:.4f}")
+            print(f"    Best val metrics: {best_checkpoint['val_metrics']}")
+            
+            merge_history['metrics_after_recovery'].append(best_checkpoint['val_metrics'])
+            merge_history['training_stats'].append(train_stats)
+            
+            # Clean up temp checkpoint if not keeping
+            if not keep_temp_checkpoints:
+                os.remove(temp_save_path)
+                print(f"  ✓ Cleaned up temporary checkpoint")
+        else:
+            print("  → Recovery training NOT needed")
+            merge_history['metrics_after_recovery'].append(eval_metric)
+            merge_history['training_stats'].append(None)
+        
+        # Save final model at target layer counts
+        print("\n[5/5] Saving Model...")
+        n_layer = orig_n_layer - merge_itr - 1
+        if n_layer in target_layers:
+            save_path = os.path.join(save_dir, f'layer-{n_layer}-{task_name}.pt')
+            
+            save_object = {
+                'model_state_dict': model.state_dict(),
+                'layer_track': tracker.get_mapping(),
+                'train_stats': merge_history['training_stats'][-1],
+                'metrics_after_merge': merge_history['metrics_after_merge'][-1],
+                'metrics_after_recovery': merge_history['metrics_after_recovery'][-1],
+                'merge_iteration': merge_itr + 1,
+                'num_layers': n_layer
+            }
+            
+            torch.save(save_object, save_path)
+            print(f"  ✓ Saved {n_layer}-layer model to {save_path}")
+        else:
+            print(f"  • {n_layer} layers (not in target list, skipping save)")
+        
+        # Store iteration info
+        merge_history['iterations'].append({
+            'iteration': merge_itr + 1,
+            'merged_layers': (merge_layer, merge_layer + 1),
+            'num_layers_after': n_layer
+        })
+        merge_history['layer_compositions'].append(tracker.get_mapping())
+        
+        print("")
+    
+    # Final summary
+    print("=" * 70)
+    print("MERGE LOOP COMPLETED")
+    print("=" * 70)
+    print(f"Total merges: {num_merges}")
+    print(f"Final layers: {len(tracker)}")
+    print(f"Final composition: {tracker.get_mapping()}")
+    
+    return merge_history
 
 ####################### Functions for Plots  #######################
 
