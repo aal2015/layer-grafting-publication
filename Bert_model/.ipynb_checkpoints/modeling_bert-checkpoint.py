@@ -287,6 +287,7 @@ class BertSelfAttention(nn.Module):
 
         # Mask heads if we want to
         if head_mask is not None:
+            # attention_probs = attention_probs * head_mask.view(1, -1, 1, 1)
             attention_probs = attention_probs * head_mask
 
         context_layer = torch.matmul(attention_probs, value_layer)
@@ -427,6 +428,8 @@ class BertLayer(nn.Module):
             self.crossattention = BertAttention(config, position_embedding_type="absolute")
         self.intermediate = BertIntermediate(config)
         self.output = BertOutput(config)
+        self.int_mask_param = None
+        self.head_mask_param = None
         
     def prune_mlp(self):
         self.intermediate = None
@@ -452,7 +455,14 @@ class BertLayer(nn.Module):
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
     ) -> Tuple[torch.Tensor]:
-        
+
+        if self.int_mask_param != None:
+            int_mask = self.int_mask_param
+            
+        if self.head_mask_param != None:
+            head_mask = self.head_mask_param
+            head_mask = head_mask.view(1, -1, 1, 1)
+            
         if self.attention is not None:
             # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
             self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
