@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from typing import Optional, Tuple, List
+import matplotlib.pyplot as plt
 from train_eval_func import get_primary_metric, eval_loop
 
 def register_importance_masks(model, device, register_heads=True, register_ffn=True):
@@ -280,6 +281,24 @@ def compute_importance_scores(
     
     return head_importance, neuron_importance
 
+
+def remaining_layers_stat(model, component='head'):
+    stats = []
+    for idx, layer in enumerate(model.bert.encoder.layer):
+        if component == 'head':
+            out_list = layer.head_mask_param.detach().cpu().tolist()
+        else:
+            out_list = layer.int_mask_param.detach().cpu().tolist()
+
+        obj = {
+            'layer': idx,
+            'n_remain': int(sum(out_list)),
+            'total': len(out_list)
+        }
+        stats.append(obj)
+
+    return stats
+
 def iterativeMask(
     model, dataloader, val_dataloader, device, task_name, max_batches=None, mask_head=True, mask_ffn=True, 
     num_att_mask=0, num_int_mask=0, num_round=5
@@ -287,10 +306,19 @@ def iterativeMask(
     # Calculate total number of heads and ffn neurons
     total_heads, total_neurons = 0, 0
     for layer in model.bert.encoder.layer:
-        total_heads   += len(layer.head_mask_param)
-        total_neurons += len(layer.int_mask_param)
+        if mask_head:
+            total_heads   += len(layer.head_mask_param)
+        if mask_ffn:
+            total_neurons += len(layer.int_mask_param)
 
-    print(f"Total Number of Heads: {total_heads}, Total Number of FFN Neurons: {total_neurons}")
+    if mask_head and mask_ffn:
+        print(f"Total Number of Heads: {total_heads}, Total Number of FFN Neurons: {total_neurons}")
+    elif mask_head:
+        print(f"Total Number of Heads: {total_heads}")
+    elif mask_ffn:
+        print(f"Total Number of FFN Neurons: {total_neurons}")
+    else:
+        return "No masking operation"
     
     target_metric = get_primary_metric(task_name)
     
@@ -304,12 +332,14 @@ def iterativeMask(
 
     mask_history = {
         'head_mask_remaining': [],
+        'head_mask_state': [],
         'int_mask_remaining': [],
+        'int_mask_state': [],
         'effected_metric': []
     }
-    for round in range(num_round):
+    for round_idx  in range(num_round):
         print("")
-        print("Round:", round)
+        print("--> Round:", round_idx )
         # Calculate Importance Score
         head_importance, neuron_importance = compute_importance_scores(
             model, dataloader, device, max_batches=max_batches, compute_heads=mask_head,
@@ -319,18 +349,49 @@ def iterativeMask(
         # Perform Masking
         if mask_head:
             apply_head_masking(model, head_importance, num_att_mask)
+            
             remaining_heads = 0
+            total_heads     = 0
             for layer in model.bert.encoder.layer:
                 remaining_heads += int(sum(layer.head_mask_param))
+                total_heads += len(layer.head_mask_param)
+            print(f"Remaining Heads: {remaining_heads}, Total Heads: {total_heads}")
+            
+            head_mask_stats = remaining_layers_stat(model, component='head')
+            head_mask_stats_list = []
+            print("Head Mask Remaining Stats:")
+            for stat in head_mask_stats:
+                remain = stat['n_remain'] * 100 / stat['total']
+                remain = round(remain, 2)
+                print(f"Layer: {stat['layer']}, total: {stat['total']}, Remain: {stat['n_remain']} ({remain}%)")
+                stat['mask'] = model.bert.encoder.layer[stat['layer']].head_mask_param.detach().cpu().tolist()
+                head_mask_stats_list.append(stat['mask'])
+                
             mask_history['head_mask_remaining'].append(remaining_heads)
-            print("Remaining Heads:", remaining_heads)
+            mask_history['head_mask_state'].append(head_mask_stats_list)
+            
         if mask_ffn:
             apply_neuron_masking(model, neuron_importance, num_int_mask)
+            
             remaining_neurons = 0
+            total_neurons     = 0
             for layer in model.bert.encoder.layer:
                 remaining_neurons += int(sum(layer.int_mask_param))
+                total_neurons += len(layer.int_mask_param)
+            print(f"Remaining FFN Neurons: {remaining_neurons}, Total FFN Neurons: {total_neurons}")
+
+            int_mask_stats = remaining_layers_stat(model, component='ffn')
+            int_mask_stats_list = []
+            print("FFN Neuron Mask Remaining Stats:")
+            for stat in int_mask_stats:
+                remain = stat['n_remain'] * 100 / stat['total']
+                remain = round(remain, 2)
+                print(f"Layer: {stat['layer']}, total: {stat['total']}, Remain: {stat['n_remain']} ({remain}%)")
+                stat['mask'] = model.bert.encoder.layer[stat['layer']].int_mask_param.detach().cpu().tolist()
+                int_mask_stats_list.append(stat['mask'])
+                
             mask_history['int_mask_remaining'].append(remaining_neurons)
-            print("Remaining FFN Neurons:", remaining_neurons)
+            mask_history['int_mask_state'].append(int_mask_stats_list)
         
         # Effected Performance
         eval_metric = eval_loop(model, val_dataloader, task_name, device)[0]
@@ -341,3 +402,293 @@ def iterativeMask(
         mask_history['effected_metric'].append(eval_metric)
 
     return mask_history
+
+
+def plot_masking_results(
+    results_dict,
+    metric='f1',
+    component='heads',
+    figsize=(10, 6),
+    save_path=None,
+    show_plot=True,
+    title=None,
+    baseline_marker=True
+):
+    """
+    Plot masking results showing component remaining vs performance metric.
+    
+    Args:
+        results_dict: Dictionary with masking results
+            Format: {
+                'head_mask_remaining': [130, 116, 102, ...],
+                'int_mask_remaining': [30000, 25000, ...],
+                'effected_metric': [
+                    {'accuracy': 0.86, 'f1': 0.909},
+                    {'accuracy': 0.85, 'f1': 0.905},
+                    ...
+                ]
+            }
+        metric: Metric to plot ('f1', 'accuracy', etc.)
+        component: 'heads' or 'neurons'
+        figsize: Figure size (width, height)
+        save_path: Path to save figure (None = don't save)
+        show_plot: Whether to display plot
+        title: Custom title (None = auto-generate)
+        baseline_marker: Whether to mark baseline (first point)
+    
+    Returns:
+        matplotlib figure object
+    
+    Examples:
+        # Plot heads remaining vs F1
+        plot_masking_results(results, metric='f1', component='heads')
+        
+        # Plot neurons remaining vs accuracy
+        plot_masking_results(results, metric='accuracy', component='neurons')
+        
+        # Compare multiple models
+        fig, ax = plt.subplots(figsize=(12, 6))
+        for model_name, results in all_results.items():
+            plot_masking_results(
+                results, metric='f1', component='heads',
+                show_plot=False, ax=ax, label=model_name
+            )
+        ax.legend()
+        plt.show()
+    """
+    # Extract data based on component
+    if component.lower() in ['heads', 'head', 'attention']:
+        remaining = results_dict.get('head_mask_remaining', [])
+        component_name = 'Heads'
+        total_initial = remaining[0] if remaining else 0
+    elif component.lower() in ['neurons', 'neuron', 'ffn', 'int']:
+        remaining = results_dict.get('int_mask_remaining', [])
+        component_name = 'FFN Neurons'
+        total_initial = remaining[0] if remaining else 0
+    else:
+        raise ValueError(f"Unknown component: {component}. Use 'heads' or 'neurons'")
+    
+    # Check if data exists
+    if not remaining:
+        raise ValueError(f"No data for {component_name}. Check 'head_mask_remaining' or 'int_mask_remaining' in results.")
+    
+    # Extract metrics
+    metrics_data = results_dict.get('effected_metric', [])
+    if not metrics_data:
+        raise ValueError("No 'effected_metric' data in results_dict")
+    
+    # Extract the specific metric
+    metric_values = [m.get(metric, None) for m in metrics_data]
+    
+    # Check for None values
+    if None in metric_values:
+        raise ValueError(f"Metric '{metric}' not found in all data points")
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Calculate percentage remaining
+    pct_remaining = [r / total_initial * 100 for r in remaining]
+    
+    # Plot main line
+    ax.plot(remaining, metric_values, 'o-', linewidth=2.5, markersize=8,
+            color='#2E86AB', label=f'{metric.upper()}', markeredgewidth=1.5,
+            markeredgecolor='white')
+    
+    # Mark baseline if requested
+    if baseline_marker and len(remaining) > 0:
+        ax.plot(remaining[0], metric_values[0], 'o', markersize=12,
+                color='#06A77D', markeredgewidth=2, markeredgecolor='white',
+                label='Baseline', zorder=5)
+    
+    # Add value labels on points
+    for i, (r, v) in enumerate(zip(remaining, metric_values)):
+        ax.text(r, v, f'{v:.3f}', fontsize=9, ha='center', va='bottom',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                         edgecolor='gray', alpha=0.7))
+    
+    # Add percentage labels on x-axis
+    ax2 = ax.twiny()
+    ax2.set_xlim(ax.get_xlim())
+    ax2.set_xticks(remaining)
+    ax2.set_xticklabels([f'{p:.0f}%' for p in pct_remaining], fontsize=9)
+    ax2.set_xlabel('Percentage Remaining', fontsize=11, fontweight='bold')
+    
+    # Formatting
+    ax.set_xlabel(f'{component_name} Remaining (Absolute Count)', fontsize=11, fontweight='bold')
+    ax.set_ylabel(metric.upper(), fontsize=11, fontweight='bold')
+    
+    if title is None:
+        title = f'{component_name} Masking: {metric.upper()} vs Remaining {component_name}'
+    ax.set_title(title, fontsize=13, fontweight='bold', pad=20)
+    
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.legend(fontsize=10, loc='best')
+    
+    # Set y-axis to start from a reasonable minimum
+    y_min = min(metric_values) - 0.02
+    y_max = max(metric_values) + 0.02
+    ax.set_ylim(y_min, y_max)
+    
+    plt.tight_layout()
+    
+    # Save if requested
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f'✓ Plot saved to {save_path}')
+    
+    # Show if requested
+    if show_plot:
+        plt.show()
+    
+    return fig
+
+def plot_masking_comparison(
+    results_dict_list,
+    labels,
+    metric='f1',
+    component='heads',
+    figsize=(12, 7),
+    save_path=None,
+    show_plot=True,
+    title=None,
+    show_percentage=True,
+    show_values=False,
+    legend_loc='best'
+):
+    """
+    Plot comparison of multiple models' masking results.
+    
+    Similar to plot_masking_results but for multiple models on same plot.
+    
+    Args:
+        results_dict_list: List of result dictionaries
+        labels: List of labels for each result (same length as results_dict_list)
+        metric: Metric to plot ('f1', 'accuracy', etc.)
+        component: 'heads' or 'neurons'
+        figsize: Figure size (width, height)
+        save_path: Path to save figure (None = don't save)
+        show_plot: Whether to display plot
+        title: Custom title (None = auto-generate)
+        show_percentage: Whether to show percentage on top x-axis
+        show_values: Whether to show value labels on points
+        legend_loc: Legend location ('best', 'upper right', 'lower left', etc.)
+    
+    Returns:
+        matplotlib figure
+    
+    Examples:
+        # Compare 12-layer vs 8-layer
+        plot_masking_comparison(
+            [results_12layer, results_8layer],
+            labels=['12-layer Baseline', '8-layer Merged'],
+            metric='f1',
+            component='heads',
+            save_path='comparison.png'
+        )
+        
+        # Compare all models with custom styling
+        plot_masking_comparison(
+            [results_12, results_8, results_7, results_6],
+            labels=['12-layer', '8-layer', '7-layer', '6-layer'],
+            metric='f1',
+            component='heads',
+            show_values=True,
+            legend_loc='lower left'
+        )
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Colors and markers for different models (supports up to 8 models)
+    colors = ['#2E86AB', '#06A77D', '#F18F01', '#C73E1D', '#6A4C93', 
+              '#E63946', '#457B9D', '#2A9D8F']
+    markers = ['o', 's', '^', 'D', 'v', 'P', '*', 'X']
+    
+    # Determine component
+    if component.lower() in ['heads', 'head', 'attention']:
+        key = 'head_mask_remaining'
+        component_name = 'Heads'
+    else:
+        key = 'int_mask_remaining'
+        component_name = 'FFN Neurons'
+    
+    # Track min/max for axis limits
+    all_remaining = []
+    all_values = []
+    
+    # Plot each model
+    for i, (results, label) in enumerate(zip(results_dict_list, labels)):
+        remaining = results.get(key, [])
+        metrics_data = results.get('effected_metric', [])
+        metric_values = [m.get(metric, 0) for m in metrics_data]
+        
+        if not remaining:
+            print(f"Warning: No data for '{label}'")
+            continue
+        
+        color = colors[i % len(colors)]
+        marker = markers[i % len(markers)]
+        
+        # Track for axis limits
+        all_remaining.extend(remaining)
+        all_values.extend(metric_values)
+        
+        # Plot line
+        ax.plot(remaining, metric_values, marker=marker, linestyle='-',
+                linewidth=2.5, markersize=8, color=color, label=label,
+                markeredgewidth=1.5, markeredgecolor='white', alpha=0.9)
+        
+        # Mark baseline (first point)
+        ax.plot(remaining[0], metric_values[0], marker=marker, markersize=12,
+                color=color, markeredgewidth=2, markeredgecolor='white',
+                zorder=5, alpha=0.7)
+        
+        # Add value labels if requested
+        if show_values:
+            for r, v in zip(remaining, metric_values):
+                ax.text(r, v, f'{v:.3f}', fontsize=8, ha='center', va='bottom',
+                       color=color, fontweight='bold', alpha=0.8)
+    
+    # Add percentage axis on top if requested
+    if show_percentage and all_remaining:
+        total_initial = max(all_remaining)
+        ax2 = ax.twiny()
+        ax2.set_xlim(ax.get_xlim())
+        
+        # Create tick positions
+        tick_positions = sorted(set(all_remaining))
+        tick_labels = [f'{r/total_initial*100:.0f}%' for r in tick_positions]
+        
+        ax2.set_xticks(tick_positions)
+        ax2.set_xticklabels(tick_labels, fontsize=9)
+        ax2.set_xlabel('Percentage Remaining', fontsize=11, fontweight='bold')
+    
+    # Formatting
+    ax.set_xlabel(f'{component_name} Remaining (Absolute Count)', 
+                  fontsize=12, fontweight='bold')
+    ax.set_ylabel(metric.upper(), fontsize=12, fontweight='bold')
+    
+    if title is None:
+        title = f'{component_name} Masking Comparison: {metric.upper()}'
+    ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
+    
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.legend(fontsize=11, loc=legend_loc, framealpha=0.95, 
+             edgecolor='gray', fancybox=True)
+    
+    # Set reasonable y-axis limits
+    if all_values:
+        y_min = min(all_values) - 0.02
+        y_max = max(all_values) + 0.02
+        ax.set_ylim(y_min, y_max)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f'✓ Plot saved to {save_path}')
+    
+    if show_plot:
+        plt.show()
+    
+    return fig
