@@ -513,6 +513,179 @@ def iterative_cka_merge_and_train(
     
     return merge_history
 
+######################### Submission Prep #########################
+
+import torch
+from tqdm import tqdm
+import pandas as pd
+
+def generate_glue_submission(
+    model,
+    test_dataloader,
+    task_name,
+    output_dir='.',
+    output_filename=None,
+    device='cuda'
+):
+    """
+    Generate GLUE submission file in TSV format for test set.
+    
+    This function creates the exact TSV format required for GLUE benchmark submission.
+    Each task has specific requirements for column names and prediction format.
+    
+    Args:
+        model: Trained BERT model
+        test_dataloader: DataLoader for test set (NO LABELS)
+        task_name: GLUE task name (case-insensitive)
+            - 'cola', 'sst2', 'mrpc', 'stsb', 'qqp', 'mnli', 'mnli-mm', 
+              'qnli', 'rte', 'wnli', 'ax'
+        output_dir: Directory to save TSV file
+        output_filename: Custom filename (None = auto-generate as {TASK}.tsv)
+        device: Device to run inference on
+    
+    Returns:
+        str: Path to generated TSV file
+    
+    GLUE Submission Format Requirements:
+        CoLA:  index, prediction (0/1)
+        SST-2: index, prediction (0/1)
+        MRPC:  index, prediction (0/1)
+        STS-B: index, prediction (0.0-5.0, regression)
+        QQP:   index, prediction (0/1)
+        MNLI:  index, prediction (entailment/neutral/contradiction)
+        QNLI:  index, prediction (entailment/not_entailment)
+        RTE:   index, prediction (entailment/not_entailment)
+        WNLI:  index, prediction (0/1)
+        AX:    index, prediction (entailment/neutral/contradiction)
+    
+    Examples:
+        # Generate MRPC submission
+        generate_glue_submission(
+            model, test_dataloader, 'mrpc',
+            output_dir='./submissions'
+        )
+        # Creates: ./submissions/MRPC.tsv
+        
+        # Generate QNLI with custom filename
+        generate_glue_submission(
+            model, test_dataloader, 'qnli',
+            output_dir='./submissions',
+            output_filename='QNLI_8layer_merged.tsv'
+        )
+    """
+    model.eval()
+    model.to(device)
+    
+    task_name = task_name.lower()
+    
+    # Task-specific configurations
+    task_configs = {
+        'cola': {'num_labels': 2, 'label_type': 'binary', 'label_list': None},
+        'sst2': {'num_labels': 2, 'label_type': 'binary', 'label_list': None},
+        'mrpc': {'num_labels': 2, 'label_type': 'binary', 'label_list': None},
+        'stsb': {'num_labels': 1, 'label_type': 'regression', 'label_list': None},
+        'qqp': {'num_labels': 2, 'label_type': 'binary', 'label_list': None},
+        'mnli': {'num_labels': 3, 'label_type': 'multiclass', 
+                 'label_list': ['entailment', 'neutral', 'contradiction']},
+        'mnli-mm': {'num_labels': 3, 'label_type': 'multiclass',
+                    'label_list': ['entailment', 'neutral', 'contradiction']},
+        'qnli': {'num_labels': 2, 'label_type': 'multiclass',
+                 'label_list': ['entailment', 'not_entailment']},
+        'rte': {'num_labels': 2, 'label_type': 'multiclass',
+                'label_list': ['entailment', 'not_entailment']},
+        'wnli': {'num_labels': 2, 'label_type': 'binary', 'label_list': None},
+        'ax': {'num_labels': 3, 'label_type': 'multiclass',
+               'label_list': ['entailment', 'neutral', 'contradiction']},
+    }
+    
+    if task_name not in task_configs:
+        raise ValueError(
+            f"Unknown task: {task_name}. "
+            f"Supported tasks: {', '.join(task_configs.keys())}"
+        )
+    
+    config = task_configs[task_name]
+    
+    print(f"Generating GLUE submission for {task_name.upper()}")
+    print(f"Task type: {config['label_type']}")
+    
+    # Generate predictions
+    predictions = []
+    indices = []
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(test_dataloader, desc="Predicting")):
+            # Move batch to device (excluding labels if present)
+            batch_inputs = {
+                k: v.to(device) for k, v in batch.items() 
+                if k not in ['labels', 'label', 'idx', 'index']
+            }
+            
+            # Forward pass
+            outputs = model(**batch_inputs)
+            logits = outputs.logits
+            
+            # Get predictions based on task type
+            if config['label_type'] == 'regression':
+                # STS-B: regression task (0.0 to 5.0)
+                preds = logits.squeeze(-1).cpu().numpy()
+                # Clip to valid range
+                preds = preds.clip(0.0, 5.0)
+            else:
+                # Classification: get argmax
+                preds = torch.argmax(logits, dim=-1).cpu().numpy()
+            
+            predictions.extend(preds.tolist())
+            
+            # # Track indices (batch index * batch_size + position in batch)
+            # batch_size = len(preds)
+            # batch_indices = list(range(batch_idx * batch_size, 
+            #                           batch_idx * batch_size + batch_size))
+            # indices.extend(batch_indices)
+
+    for i in range(len(predictions)):
+        indices.append(i)
+    
+    # Convert predictions to required format
+    if config['label_type'] == 'regression':
+        # STS-B: keep as float
+        formatted_predictions = predictions
+    elif config['label_type'] == 'multiclass' and config['label_list']:
+        # MNLI, QNLI, RTE, AX: map to label strings
+        formatted_predictions = [config['label_list'][int(p)] for p in predictions]
+    else:
+        # Binary tasks (CoLA, SST-2, MRPC, QQP, WNLI): keep as 0/1
+        formatted_predictions = [int(p) for p in predictions]
+    
+    # Create DataFrame
+    df = pd.DataFrame({
+        'index': indices,
+        'prediction': formatted_predictions
+    })
+    
+    # Determine output filename
+    if output_filename is None:
+        output_filename = f"{task_name.upper()}.tsv"
+    
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Full output path
+    output_path = os.path.join(output_dir, output_filename)
+    
+    # Save to TSV
+    df.to_csv(output_path, sep='\t', index=False)
+    
+    print(f"\n✓ Submission file created: {output_path}")
+    print(f"  Total predictions: {len(predictions)}")
+    print(f"  Format: index, prediction")
+    
+    # Show sample
+    print(f"\nFirst 5 rows:")
+    print(df.head())
+    
+    return output_path
+    
 ####################### Functions for Plots  #######################
 
 import matplotlib.pyplot as plt
