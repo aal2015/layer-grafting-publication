@@ -93,6 +93,7 @@ def eval_loop(model, dataloader, dataset, device, benchmark="glue", regression=F
 from torch.optim import AdamW
 
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm.auto import tqdm
 import time
 
@@ -117,7 +118,7 @@ def get_primary_metric(task_name):
 def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs=5, 
           lr=3e-5, patience=3, threshold=0.0, save_path=None, optimizer=None, 
           lr_scheduler=None, use_early_stopping=False, display_epoch_iter=False,
-          max_norm=0.05, benchmark="glue", regression=False):
+          max_norm=0.05, benchmark="glue", regression=False, teacher_model=None, alpha=0.5, temperature=6):
     """
     Train BERT model with optional early stopping and checkpoint saving.
     Automatically handles all GLUE task metrics.
@@ -174,6 +175,10 @@ def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs
     # Training loop
     train_start = time.time()
 
+    if teacher_model is not None:
+        print("Knowledge distillation used!")
+        teacher_model.eval()
+        
     for epoch in range(num_epochs):
         epoch_start = time.time()
         
@@ -191,6 +196,17 @@ def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs
             outputs = model(**batch)
             loss = outputs.loss
             logits = outputs.logits
+
+            # Knowledge Distillation
+            if teacher_model is not None:
+                loss_function = nn.KLDivLoss(reduction="batchmean")
+                with torch.no_grad():
+                    outputs_teacher = teacher_model(**batch)
+                assert outputs.logits.size() == outputs_teacher.logits.size()
+                loss_logits = (loss_function(
+                    F.log_softmax(outputs.logits / temperature, dim=-1),
+                    F.softmax(outputs_teacher.logits / temperature, dim=-1)) * (temperature ** 2))
+                loss = alpha * loss + (1. - alpha) * loss_logits
             
             # Compute predictions
             if regression:
@@ -320,7 +336,10 @@ def iterative_cka_merge_and_train(
     patience=2,
     save_dir='./weights/',
     keep_temp_checkpoints=False,
-    cka_max_iter=float("Inf")
+    cka_max_iter=float("Inf"),
+    teacher_model=None,
+    alpha=0.5,
+    temperature=6
 ):
     """
     Iteratively merge BERT layers using CKA similarity and recover performance.
@@ -417,17 +436,18 @@ def iterative_cka_merge_and_train(
         print("\n[4/5] Recovery Training...")
         diff = init_metric[target_metric] - eval_metric[target_metric]
         print(f"  Performance drop: {diff:.4f} (threshold: {threshold:.4f})")
-        
+
+        is_retrained = False
         if diff > threshold:
             print("  → Recovery training NEEDED")
             
             # Setup optimizer and scheduler
             optimizer = AdamW(model.parameters(), lr=recovery_lr)
             num_training_steps = recovery_epochs * len(train_dataloader)
-            lr_scheduler = set_lr_scheduler(
-                optimizer=optimizer,
-                num_training_steps=num_training_steps
-            )
+            # lr_scheduler = set_lr_scheduler(
+            #     optimizer=optimizer,
+            #     num_training_steps=num_training_steps
+            # )
             
             print(f"  → Training: {recovery_epochs} epochs, lr={recovery_lr}")
             
@@ -435,6 +455,7 @@ def iterative_cka_merge_and_train(
             temp_save_path = os.path.join(recovery_dir, f'temp_iter{merge_itr}.pt')
             
             # Train with checkpoint saving
+            lr_scheduler= None
             train_stats = train(
                 model,
                 train_dataloader,
@@ -448,7 +469,8 @@ def iterative_cka_merge_and_train(
                 optimizer=optimizer,
                 lr_scheduler=lr_scheduler,
                 save_path=temp_save_path,
-                display_epoch_iter=True
+                display_epoch_iter=True,
+                teacher_model=teacher_model, alpha=alpha, temperature=temperature
             )
             
             # CRITICAL: Reload best checkpoint
@@ -467,6 +489,8 @@ def iterative_cka_merge_and_train(
             if not keep_temp_checkpoints:
                 os.remove(temp_save_path)
                 print(f"  ✓ Cleaned up temporary checkpoint")
+
+            is_retrained = True
         else:
             print("  → Recovery training NOT needed")
             merge_history['metrics_after_recovery'].append(eval_metric)
@@ -485,7 +509,8 @@ def iterative_cka_merge_and_train(
                 'metrics_after_merge': merge_history['metrics_after_merge'][-1],
                 'metrics_after_recovery': merge_history['metrics_after_recovery'][-1],
                 'merge_iteration': merge_itr + 1,
-                'num_layers': n_layer
+                'num_layers': n_layer,
+                'is_retrained': is_retrained
             }
             
             torch.save(save_object, save_path)
@@ -510,6 +535,8 @@ def iterative_cka_merge_and_train(
     print(f"Total merges: {num_merges}")
     print(f"Final layers: {len(tracker)}")
     print(f"Final composition: {tracker.get_mapping()}")
+
+    torch.cuda.empty_cache()
     
     return merge_history
 
