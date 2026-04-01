@@ -856,3 +856,198 @@ def plot_masking_comparison(
         plt.show()
     
     return fig
+
+
+def masks_setGrad(model, set_heads=True, set_ffns=True, mode="freeze"):
+    if mode not in ["freeze", "unfreeze"]:
+        return "Send 'Freeze' or 'Unfreeze' as mode"
+    
+    for layer in model.bert.encoder.layer:
+        if set_ffns:
+            layer.int_mask_param.requires_grad = False if mode == 'freeze' else True
+            layer.int_mask_param.grad = None
+        if set_heads:
+            layer.head_mask_param.requires_grad = False if mode == 'freeze' else True
+            layer.head_mask_param.grad = None
+
+import os
+from train_eval_func import train
+from torch.optim import AdamW
+
+def iterativeMaskTrain(
+    model, dataloader, val_dataloader, device, task_name, recovery_epochs, recovery_lr,  max_batches=None, mask_head=True, mask_ffn=True, 
+    num_att_mask=0, num_int_mask=0, num_round=5, patience=3, teacher_model=None, alpha=0.5, temperature=6, save_checkpoint=True, temp_save_path=None,
+    keep_temp_checkpoints=False
+):
+    # Calculate total number of heads and ffn neurons
+    total_heads, total_neurons = 0, 0
+    for layer in model.bert.encoder.layer:
+        if mask_head:
+            total_heads   += len(layer.head_mask_param)
+        if mask_ffn:
+            total_neurons += len(layer.int_mask_param)
+
+    if mask_head and mask_ffn:
+        print(f"Total Number of Heads: {total_heads}, Total Number of FFN Neurons: {total_neurons}")
+    elif mask_head:
+        print(f"Total Number of Heads: {total_heads}")
+    elif mask_ffn:
+        print(f"Total Number of FFN Neurons: {total_neurons}")
+    else:
+        return "No masking operation"
+    
+    target_metric = get_primary_metric(task_name)
+    
+    # Original Performance
+    print("Evaluating Original Performance")
+    orig_metric = eval_loop(model, val_dataloader, task_name, device)[0]
+    threshold = orig_metric[target_metric] * 0.01
+    
+    print("  Metrics:")
+    for metric_name, value in orig_metric.items():
+        marker = "★" if metric_name == target_metric else " "
+        print(f"    {marker} {metric_name}: {value:.4f}")
+    print("Threshold:", threshold)
+
+    mask_history = {
+        'head_mask_remaining': [],
+        'head_mask_state': [],
+        'int_mask_remaining': [],
+        'int_mask_state': [],
+        'effected_metric': []
+    }
+    for round_idx  in range(num_round):
+        print("")
+        print("--> Round:", round_idx)
+
+        masks_setGrad(model, set_heads=False, mode="unfreeze")
+        
+        # Calculate Importance Score
+        head_importance, neuron_importance = compute_importance_scores(
+            model, dataloader, device, max_batches=max_batches, compute_heads=mask_head,
+            compute_ffn= mask_ffn
+        )
+
+        masks_setGrad(model, set_heads=False, mode="freeze")
+
+        # Perform Masking
+        if mask_head:
+            apply_head_masking(model, head_importance, num_att_mask)
+            
+            remaining_heads = 0
+            total_heads     = 0
+            for layer in model.bert.encoder.layer:
+                remaining_heads += int(sum(layer.head_mask_param))
+                total_heads += len(layer.head_mask_param)
+            print(f"Remaining Heads: {remaining_heads}, Total Heads: {total_heads}")
+            
+            head_mask_stats = remaining_layers_stat(model, component='head')
+            head_mask_stats_list = []
+            print("Head Mask Remaining Stats:")
+            for stat in head_mask_stats:
+                remain = stat['n_remain'] * 100 / stat['total']
+                remain = round(remain, 2)
+                print(f"Layer: {stat['layer']}, total: {stat['total']}, Remain: {stat['n_remain']} ({remain}%)")
+                stat['mask'] = model.bert.encoder.layer[stat['layer']].head_mask_param.detach().cpu().tolist()
+                head_mask_stats_list.append(stat['mask'])
+                
+            mask_history['head_mask_remaining'].append(remaining_heads)
+            mask_history['head_mask_state'].append(head_mask_stats_list)
+            
+        if mask_ffn:
+            apply_neuron_masking(model, neuron_importance, num_int_mask)
+            
+            remaining_neurons = 0
+            total_neurons     = 0
+            for layer in model.bert.encoder.layer:
+                remaining_neurons += int(sum(layer.int_mask_param))
+                total_neurons += len(layer.int_mask_param)
+            print(f"Remaining FFN Neurons: {remaining_neurons}, Total FFN Neurons: {total_neurons}")
+
+            int_mask_stats = remaining_layers_stat(model, component='ffn')
+            int_mask_stats_list = []
+            print("FFN Neuron Mask Remaining Stats:")
+            for stat in int_mask_stats:
+                remain = stat['n_remain'] * 100 / stat['total']
+                remain = round(remain, 2)
+                print(f"Layer: {stat['layer']}, total: {stat['total']}, Remain: {stat['n_remain']} ({remain}%)")
+                stat['mask'] = model.bert.encoder.layer[stat['layer']].int_mask_param.detach().cpu().tolist()
+                int_mask_stats_list.append(stat['mask'])
+                
+            mask_history['int_mask_remaining'].append(remaining_neurons)
+            mask_history['int_mask_state'].append(int_mask_stats_list)
+        
+        # Effected Performance
+        effected_eval_metric = eval_loop(model, val_dataloader, task_name, device)[0]
+        print("  Metrics:")
+        for metric_name, value in effected_eval_metric.items():
+            marker = "★" if metric_name == target_metric else " "
+            print(f"    {marker} {metric_name}: {value:.4f}")
+
+        eval_metric_obj = {'effected_eval_metric': effected_eval_metric}
+
+        diff = orig_metric[target_metric] - effected_eval_metric[target_metric]
+        if diff > threshold:
+            print("  → Recovery training NEEDED")
+            
+            # Setup optimizer and scheduler
+            optimizer = AdamW(model.parameters(), lr=recovery_lr)
+            num_training_steps = recovery_epochs * len(dataloader)
+
+            print(f"  → Training: {recovery_epochs} epochs, lr={recovery_lr}")
+
+            lr_scheduler = None
+            train_stats = train(
+                model,
+                dataloader,
+                val_dataloader,
+                task_name,
+                device,
+                num_epochs=recovery_epochs,
+                lr=recovery_lr,
+                patience=patience,
+                use_early_stopping=True,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                save_path=temp_save_path,
+                display_epoch_iter=True,
+                teacher_model=teacher_model, alpha=alpha, temperature=temperature
+            )
+
+            print("\n  → Loading best checkpoint...")
+            best_checkpoint = torch.load(temp_save_path)
+            model.load_state_dict(best_checkpoint['model_state_dict'])
+
+            trained_eval_metric = eval_loop(model, val_dataloader, task_name, device)[0]
+            eval_metric_obj['trained_eval_metric'] = trained_eval_metric
+
+            # Clean up temp checkpoint if not keeping
+            if not keep_temp_checkpoints and temp_save_path:
+                os.remove(temp_save_path)
+                print(f"  ✓ Cleaned up temporary checkpoint")       
+
+        mask_history['effected_metric'].append(eval_metric_obj)
+
+        if save_checkpoint and round_idx % 2 != 0:
+            save_obj = {
+                'model_state_dict': model.state_dict(),
+                'effected_metric': eval_metric_obj
+            }
+
+            if mask_head:
+                save_obj['remaining_heads'] = remaining_heads
+                save_obj['head_mask_state'] = head_mask_stats_list
+            if mask_ffn:
+                save_obj['remaining_neurons'] = remaining_neurons
+                save_obj['int_mask_state'] = int_mask_stats_list
+
+            n_layer = len(model.bert.encoder.layer)
+            save_path = f'./weights/{task_name}_{n_layer}'
+            if mask_head:
+                save_path += f'_att_{remaining_heads}'
+            if mask_ffn:
+                save_path += f'_ffn_{remaining_neurons}'
+            save_path += '.pt' 
+            torch.save(save_obj, save_path)
+
+    return mask_history
