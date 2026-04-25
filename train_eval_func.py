@@ -331,7 +331,7 @@ def iterative_cka_merge_and_train(
     init_metric,
     num_merges=6,
     target_layers=[6, 7, 8],
-    recovery_epochs=3,
+recovery_epochs=3,
     recovery_lr=1e-5,
     patience=2,
     save_dir='./weights/',
