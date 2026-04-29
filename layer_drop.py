@@ -64,6 +64,24 @@ def layer_drop(
         if drop_strategy == "top":
             model.bert.encoder.layer = model.bert.encoder.layer[:-1]
             layers = layers[:-1]
+            
+        elif drop_strategy == "top_merge":
+            merge_layer = len(model.bert.encoder.layer) - 2
+            print("Drop Layer:", merge_layer)
+
+            head_importance, neuron_importance = compute_importance_scores(model, train_dataloader, device, compute_heads=True, compute_ffn=True)
+
+            head_imp1, indices1 = torch.sort(head_importance[merge_layer], descending=True)
+            head_imp2, indices2 = torch.sort(head_importance[merge_layer+1], descending=True)
+    
+            # neuron_imp1, indices1 = torch.sort(neuron_importance[merge_layer], descending=True)        
+            # neuron_imp2, indices1 = torch.sort(neuron_importance[merge_layer+1], descending=True)
+            
+            # merge_mha(model, model.bert.encoder.layer[merge_layer], model.bert.encoder.layer[merge_layer+1], head_imp1, head_imp2, device, 4)
+            # merge_ff(model, model.bert.encoder.layer[merge_layer], model.bert.encoder.layer[merge_layer+1], neuron_imp1, neuron_imp2, device, extra_neurons=1024)
+            merge_mha(model, model.bert.encoder.layer[merge_layer], model.bert.encoder.layer[merge_layer+1], head_imp1, head_imp2, device, 4)
+            # merge_ff(model, model.bert.encoder.layer[merge_layer], model.bert.encoder.layer[merge_layer+1], neuron_imp1, neuron_imp2, device, extra_neurons=0)
+            del model.bert.encoder.layer[merge_layer]
         elif drop_strategy == "contribution":
             cls_reps_similarity = cka_evaluator.pairwise(
                 model, 
@@ -135,7 +153,6 @@ def layer_drop(
             merge_ff(model, model.bert.encoder.layer[merge_layer], model.bert.encoder.layer[merge_layer+1], neuron_imp1, neuron_imp2, device, extra_neurons=1024)
     
             del model.bert.encoder.layer[merge_layer]
-            
         else:
             return "Specify drop strategy"
 
