@@ -26,6 +26,7 @@ def layer_drop(
     save_dir='./weights/',
     keep_temp_checkpoints=False,
     cka_max_iter=float("Inf"),
+    imp_score_max_batches=float("Inf"),
     teacher_model=None,
     alpha=0.5,
     temperature=6,
@@ -64,7 +65,6 @@ def layer_drop(
         if drop_strategy == "top":
             model.bert.encoder.layer = model.bert.encoder.layer[:-1]
             layers = layers[:-1]
-            
         elif drop_strategy == "top_merge":
             merge_layer = len(model.bert.encoder.layer) - 2
             print("Drop Layer:", merge_layer)
@@ -82,6 +82,28 @@ def layer_drop(
             merge_mha(model, model.bert.encoder.layer[merge_layer], model.bert.encoder.layer[merge_layer+1], head_imp1, head_imp2, device, 4)
             # merge_ff(model, model.bert.encoder.layer[merge_layer], model.bert.encoder.layer[merge_layer+1], neuron_imp1, neuron_imp2, device, extra_neurons=0)
             del model.bert.encoder.layer[merge_layer]
+        if drop_strategy == "imp_score":
+            head_importance, neuron_importance = compute_importance_scores(model, train_dataloader, device, compute_heads=True, compute_ffn=True, max_batches=imp_score_max_batches)
+
+            head_scores = torch.stack(head_importance).cpu()
+
+            # Sum all heads inside each layer
+            layer_scores = head_scores.sum(dim=1)
+
+            normalized_scores = (
+                (layer_scores - layer_scores.min())
+                / (layer_scores.max() - layer_scores.min())
+            )
+
+            merge_layer = int(torch.argmin(normalized_scores))
+            print("Drop Layer:", merge_layer)
+
+            model.bert.encoder.layer = nn.ModuleList(
+                [layer for i, layer in enumerate(model.bert.encoder.layer) if i != merge_layer]
+            )
+            model.config.num_hidden_layers = len(model.bert.encoder.layer)
+
+            layers.pop(merge_layer)
         elif drop_strategy == "contribution":
             cls_reps_similarity = cka_evaluator.pairwise(
                 model, 
