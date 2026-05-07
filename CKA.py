@@ -183,7 +183,8 @@ class CKAEvaluator:
             progress_bar.update(1)
                     
         # averaging
-        reps_similarity = reps_similarity / n_batch
+        num_steps = min(n_batch, max_iter)
+        reps_similarity = reps_similarity / num_steps
         # atts_similarity = atts_similarity / n_batch
         
         # return reps_similarity, atts_similarity

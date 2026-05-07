@@ -104,6 +104,51 @@ def layer_drop(
             model.config.num_hidden_layers = len(model.bert.encoder.layer)
 
             layers.pop(merge_layer)
+        elif drop_strategy == "imp_score_merge":
+            head_importance, neuron_importance = compute_importance_scores(model, train_dataloader, device, compute_heads=True, compute_ffn=True, max_batches=imp_score_max_batches)
+
+            ## Finding weakest layer by finding the sum of heads sensitivity
+            # Sum of all heads sensitivity per layer
+            layer_scores = torch.tensor([
+                h.mean().item()
+                for h in head_importance
+            ])
+
+            normalized_scores = (
+                (layer_scores - layer_scores.min())
+                / (layer_scores.max() - layer_scores.min())
+            )
+
+            weakest_layer = int(torch.argmin(normalized_scores))
+
+            ## Selecting Neighor for Merging
+            # Checking if weakest layer at edges
+            if weakest_layer == 0:
+                merge_layer = 0
+            elif weakest_layer == len(normalized_scores) - 1:
+                merge_layer = weakest_layer - 1
+            else:
+                neuron_scores = torch.stack(neuron_importance).cpu()
+    
+                # Sum all neurons inside each layer
+                layer_scores = neuron_scores.sum(dim=1)
+    
+                normalized_scores = (
+                    (layer_scores - layer_scores.min())
+                    / (layer_scores.max() - layer_scores.min())
+                )
+                if normalized_scores[weakest_layer - 1] < normalized_scores[weakest_layer + 1]:
+                    merge_layer = weakest_layer - 1
+                else:
+                    merge_layer = weakest_layer
+
+            head_imp1, indices1 = torch.sort(head_importance[merge_layer], descending=True)
+            head_imp2, indices2 = torch.sort(head_importance[merge_layer+1], descending=True)
+
+            merge_mha(model, model.bert.encoder.layer[merge_layer], model.bert.encoder.layer[merge_layer+1], head_imp1, head_imp2, device, 4)
+
+            layers.pop(merge_layer)
+            del model.bert.encoder.layer[merge_layer]
         elif drop_strategy == "contribution":
             cls_reps_similarity = cka_evaluator.pairwise(
                 model, 
