@@ -213,9 +213,15 @@ def compute_importance_scores(
             )
     
     if compute_ffn:
-        if model.bert.encoder.layer[0].int_mask_param is None:
+        has_any_ffn_mask = any(
+            hasattr(layer, "int_mask_param") and
+            layer.int_mask_param is not None
+            for layer in model.bert.encoder.layer
+        )
+    
+        if not has_any_ffn_mask:
             raise ValueError(
-                "FFN masks not registered! Call register_importance_masks(model, device) first."
+                "No FFN masks registered!"
             )
     
     # Initialize importance accumulators
@@ -230,7 +236,15 @@ def compute_importance_scores(
     if compute_ffn:
         neuron_importance = []
         for layer in model.bert.encoder.layer:
-            neuron_importance.append(torch.zeros_like(layer.int_mask_param))
+            if (
+                hasattr(layer, "int_mask_param") and
+                layer.int_mask_param is not None
+            ):
+                neuron_importance.append(
+                    torch.zeros_like(layer.int_mask_param)
+                )
+            else:
+                neuron_importance.append(None)
     
     # Accumulate gradients
     tot_tokens = 0.0
@@ -262,7 +276,12 @@ def compute_importance_scores(
             if compute_heads and layer.head_mask_param.grad is not None:
                 head_importance[layer_idx] += layer.head_mask_param.grad.abs().detach()
             
-            if compute_ffn and layer.int_mask_param.grad is not None:
+            if (
+                compute_ffn and
+                hasattr(layer, "int_mask_param") and
+                layer.int_mask_param is not None and
+                layer.int_mask_param.grad is not None
+            ):
                 neuron_importance[layer_idx] += layer.int_mask_param.grad.abs().detach()
         
         # Zero gradients
@@ -277,7 +296,8 @@ def compute_importance_scores(
     
     if compute_ffn:
         for layer_idx in range(n_layers):
-            neuron_importance[layer_idx] /= tot_tokens
+            if neuron_importance[layer_idx] is not None:
+                neuron_importance[layer_idx] /= tot_tokens
     
     return head_importance, neuron_importance
 
