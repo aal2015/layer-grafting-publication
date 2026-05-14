@@ -405,6 +405,7 @@ class BertOutput(nn.Module):
     ) -> torch.Tensor:
         if self.dense is None:
             hidden_states = self.LayerNorm(input_tensor)
+            # return input_tensor
         else:
             hidden_states = self.dense(hidden_states)
             hidden_states = self.dropout(hidden_states)

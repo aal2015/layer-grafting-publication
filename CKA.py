@@ -123,10 +123,21 @@ class CKAEvaluator:
             only_cls_embeddings.append(cls_embedding)
             
         return only_cls_embeddings
+
+    def flatten_atts(attention_outputs):
+        """
+        attention_outputs: list of tensors, each (batch, heads, seq_len, seq_len)
+        flatten heads + attention map -> (batch, heads * seq_len * seq_len)
+        """
+        flattened = []
+        for att in attention_outputs:
+            # att: (batch, heads, seq_len, seq_len)
+            flattened.append(torch.flatten(att, start_dim=1))  # (batch, heads*seq_len*seq_len)
+        return flattened
     
     def _pairwise_helper(self, sublayer_outs, only_cls_token=False, is_att = False):
         if is_att:
-            sublayer_outs = flatten_atts(sublayer_outs)
+            sublayer_outs = self.flatten_atts(sublayer_outs)
         elif only_cls_token:
             sublayer_outs = self._extract_cls_token_embedding(sublayer_outs)
             
@@ -189,3 +200,40 @@ class CKAEvaluator:
         
         # return reps_similarity, atts_similarity
         return reps_similarity
+
+    def subLayer_pairwise(self, model, dataloader, device, only_cls_token=False, max_iter=float("Inf")):
+        model.set_use_module_grafting(False)
+        model.set_use_scc_status(False)
+        
+        n_batch = len(dataloader)
+        reps_similarity, atts_similarity = None, None
+    
+        progress_bar = tqdm(range(min(n_batch, max_iter)), desc="CKA Evaluation")
+        
+        model.eval()
+        for step, batch in enumerate(dataloader):
+            if step == max_iter:
+                break
+                
+            batch = {k: v.to(device) for k, v in batch.items()}
+            
+            with torch.no_grad():
+                output = model(**batch)
+            
+            reps = output.hidden_states['hidden_states'][1:]  # omit embedding layer
+            atts = output.attentions                          # list of (batch, heads, seq, seq)
+            
+            if reps_similarity is None:
+                reps_similarity = self._pairwise_helper(reps, only_cls_token=only_cls_token)
+                atts_similarity = self._pairwise_helper(atts, is_att=True)
+            else:
+                reps_similarity += self._pairwise_helper(reps, only_cls_token=only_cls_token)
+                atts_similarity += self._pairwise_helper(atts, is_att=True)   # bug in original: was =+
+            
+            progress_bar.update(1)
+        
+        num_steps = min(n_batch, max_iter)
+        reps_similarity = reps_similarity / num_steps
+        atts_similarity = atts_similarity / num_steps
+        
+        return reps_similarity, atts_similarity
