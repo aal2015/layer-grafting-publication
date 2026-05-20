@@ -124,7 +124,7 @@ class CKAEvaluator:
             
         return only_cls_embeddings
 
-    def flatten_atts(attention_outputs):
+    def flatten_atts(self, attention_outputs):
         """
         attention_outputs: list of tensors, each (batch, heads, seq_len, seq_len)
         flatten heads + attention map -> (batch, heads * seq_len * seq_len)
@@ -134,6 +134,40 @@ class CKAEvaluator:
             # att: (batch, heads, seq_len, seq_len)
             flattened.append(torch.flatten(att, start_dim=1))  # (batch, heads*seq_len*seq_len)
         return flattened
+
+    def _interleaved_pairwise_helper(self, atts_outs, reps_outs, only_cls_token=False):
+        """
+        Build a 2N x 2N CKA matrix by interleaving att and ffn sublayer outputs.
+        Order: [Att_1, FFN_1, Att_2, FFN_2, ..., Att_N, FFN_N]
+        """
+        # flatten atts: (batch, heads, seq, seq) -> (batch, heads*seq*seq)
+        atts_outs = self.flatten_atts(atts_outs)
+    
+        # flatten reps: either cls token or full sequence
+        if only_cls_token:
+            reps_outs = self._extract_cls_token_embedding(reps_outs)
+    
+        # flatten both to (batch, D)
+        atts_flat = [torch.flatten(x, start_dim=1) for x in atts_outs]
+        reps_flat = [torch.flatten(x, start_dim=1) for x in reps_outs]
+    
+        # interleave: [att_0, ffn_0, att_1, ffn_1, ...]
+        interleaved = []
+        for att, ffn in zip(atts_flat, reps_flat):
+            interleaved.append(att)
+            interleaved.append(ffn)
+    
+        # compute full 2N x 2N CKA matrix
+        S = len(interleaved)
+        layers_similarity = []
+        for out_1 in interleaved:
+            row = []
+            for out_2 in interleaved:
+                cka_value = self.cuda_cka.linear_CKA(out_1, out_2)
+                row.append(cka_value.detach().cpu())
+            layers_similarity.append(np.array(row))
+    
+        return np.array(layers_similarity)  # (2N, 2N)
     
     def _pairwise_helper(self, sublayer_outs, only_cls_token=False, is_att = False):
         if is_att:
@@ -201,39 +235,49 @@ class CKAEvaluator:
         # return reps_similarity, atts_similarity
         return reps_similarity
 
-    def subLayer_pairwise(self, model, dataloader, device, only_cls_token=False, max_iter=float("Inf")):
+    def subLayer_interleaved_pairwise(self, model, dataloader, device, only_cls_token=False, max_iter=float("Inf")):
+        """
+        Computes a 2N x 2N interleaved CKA similarity matrix.
+        Rows/cols ordered as [Att_1, FFN_1, Att_2, FFN_2, ..., Att_N, FFN_N].
+        Also returns the original reps and atts matrices for compatibility.
+        """
         model.set_use_module_grafting(False)
         model.set_use_scc_status(False)
-        
-        n_batch = len(dataloader)
-        reps_similarity, atts_similarity = None, None
     
-        progress_bar = tqdm(range(min(n_batch, max_iter)), desc="CKA Evaluation")
-        
+        n_batch = len(dataloader)
+        reps_similarity = None
+        atts_similarity = None
+        sub_similarity  = None
+    
+        progress_bar = tqdm(range(min(n_batch, max_iter)), desc="CKA Sublayer Evaluation")
+    
         model.eval()
         for step, batch in enumerate(dataloader):
             if step == max_iter:
                 break
-                
+    
             batch = {k: v.to(device) for k, v in batch.items()}
-            
+    
             with torch.no_grad():
                 output = model(**batch)
-            
-            reps = output.hidden_states['hidden_states'][1:]  # omit embedding layer
-            atts = output.attentions                          # list of (batch, heads, seq, seq)
-            
-            if reps_similarity is None:
+    
+            reps = output.hidden_states['hidden_states'][1:]
+            atts = output.attentions['attention_head']
+    
+            if sub_similarity is None:
                 reps_similarity = self._pairwise_helper(reps, only_cls_token=only_cls_token)
                 atts_similarity = self._pairwise_helper(atts, is_att=True)
+                sub_similarity  = self._interleaved_pairwise_helper(atts, reps, only_cls_token=only_cls_token)
             else:
                 reps_similarity += self._pairwise_helper(reps, only_cls_token=only_cls_token)
-                atts_similarity += self._pairwise_helper(atts, is_att=True)   # bug in original: was =+
-            
+                atts_similarity += self._pairwise_helper(atts, is_att=True)
+                sub_similarity  += self._interleaved_pairwise_helper(atts, reps, only_cls_token=only_cls_token)
+    
             progress_bar.update(1)
-        
+    
         num_steps = min(n_batch, max_iter)
         reps_similarity = reps_similarity / num_steps
         atts_similarity = atts_similarity / num_steps
-        
-        return reps_similarity, atts_similarity
+        sub_similarity  = sub_similarity  / num_steps
+    
+        return reps_similarity, atts_similarity, sub_similarity

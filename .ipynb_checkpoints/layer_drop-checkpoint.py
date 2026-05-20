@@ -333,3 +333,180 @@ def layer_drop(
     }
 
     return return_obj
+
+def ffn_drop(
+    model,
+    train_dataloader,
+    val_dataloader,
+    task_name,
+    device,
+    init_metric,
+    cka_evaluator=None,
+    num_merges=6,
+    target_layers=[3, 4, 5, 6, 7],
+    recovery_epochs=10,
+    recovery_lr=1e-5,
+    patience=2,
+    save_dir='./weights/',
+    keep_temp_checkpoints=False,
+    cka_max_iter=float("Inf"),
+    imp_score_max_batches=float("Inf"),
+    teacher_model=None,
+    alpha=0.5,
+    temperature=6,
+    drop_strategy="top",
+    iterations=9,
+    regression=False
+):
+    recovery_dir = save_dir
+    save_dir = save_dir + drop_strategy+ "/"
+    
+    target_metric = get_primary_metric(task_name)
+    threshold = init_metric[target_metric] * 0.01
+
+    # Create recovery checkpoint directory
+    recovery_dir = os.path.join(recovery_dir, 'recovery')
+    os.makedirs(recovery_dir, exist_ok=True)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    print(f"Target Metric for {task_name}: {target_metric}")
+    print(f"Original {target_metric} score: {init_metric[target_metric]:.4f}")
+    print(f"Recovery threshold: {threshold:.4f}")
+    print("")
+
+    performance_track = []
+    remaining_layers = []
+    
+    performance_track.append(init_metric)
+    for iteration in range(iterations):
+        print(" --> Iteration:", iteration + 1)
+        n_layer = 12 - iteration - 1
+        
+        if drop_strategy == "top":    
+            prune_mlp(model, n_layer)
+        elif drop_strategy == "alt":
+            if iterations > 6:
+                print("Iterations specified too high")
+                return
+            target_layers = [11, 9, 7, 5, 3, 1]
+            prune_mlp(model, target_layers[iteration])
+        else:
+            print("Please choose correct MLP dropping strategy")
+            return
+        
+        print("Number of Remaining MLPs:", n_layer)
+    
+        # Post Drop Performance 
+        eval_metric = eval_loop(model, val_dataloader, task_name, device, regression=regression)[0]
+        
+        print("  Post Operation Metrics:")
+        for metric_name, value in eval_metric.items():
+            marker = "★" if metric_name == target_metric else " "
+            print(f"    {marker} {metric_name}: {value:.4f}")
+
+    
+        # Recovery Training
+        diff = init_metric[target_metric] - eval_metric[target_metric]
+        print(f"  Performance drop: {diff:.4f} (threshold: {threshold:.4f})")
+
+        is_retrained = False
+        if diff > threshold:
+            print("  → Recovery training NEEDED")
+
+            # Setup optimizer and scheduler
+            optimizer = AdamW(model.parameters(), lr=recovery_lr)
+            num_training_steps = recovery_epochs * len(train_dataloader)
+            lr_scheduler = set_lr_scheduler(
+                optimizer=optimizer,
+                num_training_steps=num_training_steps
+            )
+            
+            print(f"  → Training: {recovery_epochs} epochs, lr={recovery_lr}")
+            
+            # Temporary checkpoint path
+            temp_save_path = os.path.join(recovery_dir, f'temp_iter{iteration}-{task_name}.pt')
+            
+            # Train with checkpoint saving
+            # lr_scheduler= None
+            train_stats = train(
+                model,
+                train_dataloader,
+                val_dataloader,
+                task_name,
+                device,
+                num_epochs=recovery_epochs,
+                lr=recovery_lr,
+                patience=patience,
+                use_early_stopping=True,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                save_path=temp_save_path,
+                display_epoch_iter=True,
+                regression=regression,
+                teacher_model=teacher_model, alpha=alpha, temperature=temperature
+            )
+
+             # CRITICAL: Reload best checkpoint
+            print("\n  → Loading best checkpoint...")
+            best_checkpoint = torch.load(temp_save_path)
+            model.load_state_dict(best_checkpoint['model_state_dict'])
+            
+            print(f"  ✓ Loaded best checkpoint from epoch {best_checkpoint['epoch']}")
+            print(f"    Best val loss: {best_checkpoint['val_loss']:.4f}")
+            print(f"    Best val metrics: {best_checkpoint['val_metrics']}")
+            
+            # merge_history['metrics_after_recovery'].append(best_checkpoint['val_metrics'])
+            # merge_history['training_stats'].append(train_stats)
+            
+            # Clean up temp checkpoint if not keeping
+            if not keep_temp_checkpoints:
+                os.remove(temp_save_path)
+                print(f"  ✓ Cleaned up temporary checkpoint")
+
+            is_retrained = True
+        else:
+            print("  → Recovery training NOT needed")
+
+        eval_metric = eval_loop(model, val_dataloader, task_name, device, regression=regression)[0]
+        performance_track.append(eval_metric)
+
+        if n_layer in target_layers:
+            save_path = os.path.join(save_dir, f'layer-{n_layer}-{task_name}.pt')
+            
+            save_object = {
+                'model_state_dict': model.state_dict(),
+                # 'layer_track': tracker.get_mapping(),
+                # 'train_stats': merge_history['training_stats'][-1],
+                # 'metrics_after_merge': merge_history['metrics_after_merge'][-1],
+                # 'metrics_after_recovery': merge_history['metrics_after_recovery'][-1],
+                'merge_iteration': iteration + 1,
+                'num_layers': n_layer,
+                'is_retrained': is_retrained
+            }
+            
+            torch.save(save_object, save_path)
+            print(f"  ✓ Saved {n_layer}-layer model to {save_path}")
+        else:
+            print(f"  • {n_layer} layers (not in target list, skipping save)")
+
+        print("")
+
+    return_obj = {
+        "performance_track": performance_track,
+        "remaining_layers": remaining_layers
+    }
+
+    return return_obj
+
+    
+def prune_mlp(model, layer):
+    """ This method shows how to prune head (remove heads weights) based on
+        the head importance scores as described in Michel et al. (http://arxiv.org/abs/1905.10650)
+    """
+    # original_num_params = sum(p.numel() for p in model.parameters())
+    model.prune_mlps([layer])
+    # pruned_num_params = sum(p.numel() for p in model.parameters())
+
+    model.bert.encoder.layer[layer].int_mask_param = None
+    
+    # print("Pruning, original num of params:  %.2e, after pruning %.2e (%.1f percents)" % (original_num_params, pruned_num_params, pruned_num_params / original_num_params * 100))
