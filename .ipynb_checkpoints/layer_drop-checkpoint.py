@@ -390,6 +390,115 @@ def ffn_drop(
                 return
             target_layers = [11, 9, 7, 5, 3, 1]
             prune_mlp(model, target_layers[iteration])
+        elif drop_strategy == "similarity_merge":
+            #### selecting very similar layers (both still have mlps)
+            cls_reps_similarity = cka_eval.pairwise(
+                model, 
+                train_dataloader, 
+                device, 
+                only_cls_token=True, 
+                max_iter=130
+            )
+
+            adj_similarities = []
+            for i in range(1, len(cls_reps_similarity)):
+                adj_similarities.append(cls_reps_similarity[i-1][i])
+
+            high_sim_indices = []
+            for idx, value in enumerate(adj_similarities):
+                if (
+                    value > 0.8
+                    and model.bert.encoder.layer[idx].int_mask_param is not None
+                    and model.bert.encoder.layer[idx + 1].int_mask_param is not None
+                ):
+                    high_sim_indices.append(idx)
+
+            if len(high_sim_indices) == 0:
+                print("No highly similar layer pairs found.")
+                break
+
+            #### selecting weakest similar layer
+            head_importance, neuron_importance = compute_importance_scores(model, train_dataloader, device, compute_heads=True, compute_ffn=True)
+
+            # normalizing ffn neuron scores
+            neuron_layer_scores = torch.tensor([
+                h.mean().item() if h is not None else 0.0
+                for h in neuron_importance
+            ])
+            neuron_normalized_scores = (
+                (neuron_layer_scores - neuron_layer_scores.min())
+                / (neuron_layer_scores.max() - neuron_layer_scores.min())
+            )
+
+            # selecting weaskest sensitive pair
+            PROTECTED_THRESHOLD = 0.8
+
+            min_idx, min_score = None, float('inf')
+            for idx in high_sim_indices:
+                mlp1_sen_score = float(neuron_normalized_scores[idx])
+                mlp2_sen_score = float(neuron_normalized_scores[idx+1])
+
+                # # protect only when BOTH are highly sensitive
+                if (
+                    mlp1_sen_score > PROTECTED_THRESHOLD
+                    or mlp2_sen_score > PROTECTED_THRESHOLD
+                ):
+                    continue
+                
+                mean_score = (mlp1_sen_score + mlp2_sen_score) / 2
+                if mean_score < min_score:
+                    min_score = mean_score
+                    min_idx = idx
+
+            if min_idx == None:
+                print("No highly similar layer pairs below protected threshold found.")
+                break
+            
+            print(f"Selected Pair: {min_idx}, {min_idx + 1}")
+            # print(min_score)
+
+            # determining scaling for attention heads and FFN neurons for the merged layer
+            head_addition, ffn_multiplier = compute_merge_scaling_factors(min_score)
+            print(head_addition, ffn_multiplier)
+            
+            # determining to merge in merge or later layer
+            ratio = (
+                neuron_normalized_scores[min_idx + 1]
+                / (neuron_normalized_scores[min_idx] + 1e-8)
+            )
+            if ratio < 0.3:
+                # layer2 much weaker
+                # direction = "into_former"
+                source_layer = min_idx + 1
+                target_layer = min_idx
+            else:
+                # normal case
+                # direction = "into_latter"
+                source_layer = min_idx
+                target_layer = min_idx + 1
+
+            # head_imp1, indices1 = torch.sort(head_importance[source_layer], descending=True)
+            # head_imp2, indices2 = torch.sort(head_importance[target_layer], descending=True)
+    
+            neuron_imp1, indices1 = torch.sort(neuron_importance[source_layer], descending=True)        
+            neuron_imp2, indices1 = torch.sort(neuron_importance[target_layer], descending=True)
+
+            max_width = max(
+                model.bert.encoder.layer[source_layer].int_mask_param.shape[0], 
+                model.bert.encoder.layer[target_layer].int_mask_param.shape[0]
+            )
+
+            extra_neurons = int(max_width * (ffn_multiplier - 1))
+
+            merge_ff(
+                model, model.bert.encoder.layer[source_layer], model.bert.encoder.layer[target_layer], 
+                neuron_imp1, neuron_imp2, device, extra_neurons=extra_neurons
+            )
+            prune_mlp(model, source_layer)
+            print(f"Layer {source_layer} pruned!")
+
+            torch.cuda.empty_cache()
+            # return
         else:
             print("Please choose correct MLP dropping strategy")
             return

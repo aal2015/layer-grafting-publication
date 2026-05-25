@@ -431,6 +431,8 @@ class BertLayer(nn.Module):
         self.output = BertOutput(config)
         self.int_mask_param = None
         self.head_mask_param = None
+        self.head_layer_mask_param = None
+        self.mlp_mask = None
         
     def prune_mlp(self):
         self.intermediate = None
@@ -463,6 +465,12 @@ class BertLayer(nn.Module):
         if self.head_mask_param != None:
             head_mask = self.head_mask_param
             head_mask = head_mask.view(1, -1, 1, 1)
+
+        if self.head_layer_mask_param != None:
+            head_layer_mask = self.head_layer_mask_param
+
+        if self.mlp_mask != None:
+            mlp_mask = self.mlp_mask
             
         if self.attention is not None:
             # decoder uni-directional self-attention cached key/values tuple is at positions 1,2

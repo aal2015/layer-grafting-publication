@@ -5,59 +5,86 @@ from typing import Optional, Tuple, List
 import matplotlib.pyplot as plt
 from train_eval_func import get_primary_metric, eval_loop
 
-def register_importance_masks(model, device, register_heads=True, register_ffn=True):
+def register_importance_masks(model, device, 
+                          register_mha=True, register_mlp=True,
+                          register_mha_layer=True, register_mlp_layer=True):
     """
-    Register importance masks for heads and/or FFN.
+    Register importance masks for MHA and/or FFN at two granularities:
     
-    Flexible registration - can register only heads, only FFN, or both.
+    Fine-grained (existing):
+        head_mask_param   : (num_heads,)        — per-head gate
+        int_mask_param    : (intermediate_size,) — per-neuron gate
+    
+    Layer-level (new):
+        head_layer_mask_param : (1,) scalar — gates entire MHA sublayer output
+        mlp_mask              : (1,) scalar — gates entire FFN sublayer output
     
     Args:
-        model: BERT model
-        device: torch device
-        register_heads: Whether to register head masks (default: True)
-        register_ffn: Whether to register FFN masks (default: True)
-    
-    Examples:
-        # Register both (most common)
-        register_importance_masks(model, device)
-        
-        # Register only heads
-        register_importance_masks(model, device, register_heads=True, register_ffn=False)
-        
-        # Register only FFN
-        register_importance_masks(model, device, register_heads=False, register_ffn=True)
+        model             : BERT model
+        device            : torch device
+        register_mha      : register per-head mask (head_mask_param)
+        register_mlp      : register per-neuron mask (int_mask_param)
+        register_mha_layer: register scalar MHA layer gate (head_layer_mask_param)
+        register_mlp_layer: register scalar FFN layer gate (mlp_mask)
     """
-    if not register_heads and not register_ffn:
-        raise ValueError("Must register at least one of: heads or FFN")
-    
+    if not any([register_mha, register_mlp, register_mha_layer, register_mlp_layer]):
+        raise ValueError("Must register at least one mask type")
+
     for layer_idx, layer in enumerate(model.bert.encoder.layer):
-        if register_heads:
-            n_heads = layer.attention.self.num_attention_heads
-            layer.head_mask_param = nn.Parameter(
-                torch.ones(n_heads, dtype=torch.float32, device=device),
-                requires_grad=True
-            )
-        
-        if register_ffn:
-            ffn_dim = layer.intermediate.dense.out_features
-            layer.int_mask_param = nn.Parameter(
-                torch.ones(ffn_dim, dtype=torch.float32, device=device),
-                requires_grad=True
-            )
-        
-        # Print registration info
         parts = []
-        if register_heads:
-            parts.append(f"{layer.attention.self.num_attention_heads} heads")
-        if register_ffn:
-            parts.append(f"{layer.intermediate.dense.out_features} neurons")
-        
-        print(f"  Layer {layer_idx}: Registered masks ({', '.join(parts)})")
-    
+
+        # --- fine-grained: per-head ---
+        if register_mha:
+            if layer.attention is None:
+                print(f"  Layer {layer_idx}: MHA pruned, skipping head_mask_param")
+            else:
+                n_heads = layer.attention.self.num_attention_heads
+                layer.head_mask_param = nn.Parameter(
+                    torch.ones(n_heads, dtype=torch.float32, device=device),
+                    requires_grad=True
+                )
+                parts.append(f"{n_heads} heads")
+
+        # --- fine-grained: per-neuron ---
+        if register_mlp:
+            if layer.intermediate is None:
+                print(f"  Layer {layer_idx}: FFN pruned, skipping int_mask_param")
+            else:
+                ffn_dim = layer.intermediate.dense.out_features
+                layer.int_mask_param = nn.Parameter(
+                    torch.ones(ffn_dim, dtype=torch.float32, device=device),
+                    requires_grad=True
+                )
+                parts.append(f"{ffn_dim} neurons")
+
+        # --- layer-level: scalar MHA gate ---
+        if register_mha_layer:
+            if layer.attention is None:
+                print(f"  Layer {layer_idx}: MHA pruned, skipping head_layer_mask_param")
+            else:
+                layer.head_layer_mask_param = nn.Parameter(
+                    torch.ones(1, dtype=torch.float32, device=device),
+                    requires_grad=True
+                )
+                parts.append("MHA layer gate")
+
+        # --- layer-level: scalar FFN gate ---
+        if register_mlp_layer:
+            if layer.intermediate is None:
+                print(f"  Layer {layer_idx}: FFN pruned, skipping mlp_mask")
+            else:
+                layer.mlp_mask = nn.Parameter(
+                    torch.ones(1, dtype=torch.float32, device=device),
+                    requires_grad=True
+                )
+                parts.append("FFN layer gate")
+
+        print(f"  Layer {layer_idx}: Registered ({', '.join(parts)})")
+
     return model
  
  
-def remove_importance_masks(model, remove_heads=True, remove_ffn=True):
+def remove_importance_masks(model, remove_heads=True, remove_ffn=True, remove_mha=True, remove_mlp=True):
     """
     Remove registered masks from layers.
     
@@ -71,6 +98,10 @@ def remove_importance_masks(model, remove_heads=True, remove_ffn=True):
             layer.head_mask_param = None
         if remove_ffn:
             layer.int_mask_param = None
+        if remove_mha:
+            layer.head_layer_mask_param  = None
+        if remove_mlp:
+            layer.mlp_mask  = None
     
     parts = []
     if remove_heads:
@@ -301,6 +332,206 @@ def compute_importance_scores(
     
     return head_importance, neuron_importance
 
+def compute_layer_importance_scores(
+    model,
+    dataloader,
+    device,
+    max_batches: Optional[int] = None,
+    compute_mha: bool = True,
+    compute_ffn: bool = True,
+    compute_heads: bool = False,
+    compute_neurons: bool = False,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], 
+           Optional[List[torch.Tensor]], Optional[List[torch.Tensor]]]:
+    """
+    Compute importance scores at both layer-level and fine-grained level in a single pass.
+    
+    Layer-level (scalar gates):
+        head_layer_mask_param → mha_importance  : (n_layers,) normalized [0,1]
+        mlp_mask              → ffn_importance  : (n_layers,) normalized [0,1]
+    
+    Fine-grained (vector gates):
+        head_mask_param  → head_importance  : List[(num_heads,)] per layer
+        int_mask_param   → neuron_importance: List[(intermediate_size,)] per layer
+    
+    Args:
+        model           : BERT model with registered masks
+        dataloader      : Dataloader for importance computation
+        device          : torch device
+        max_batches     : Limit batches (None = use all)
+        compute_mha     : Layer-level MHA importance via scalar gate
+        compute_ffn     : Layer-level FFN importance via scalar gate
+        compute_heads   : Fine-grained per-head importance
+        compute_neurons : Fine-grained per-neuron importance
+
+    Returns:
+        (mha_importance, ffn_importance, head_importance, neuron_importance)
+        Any disabled component returns None.
+
+    Examples:
+        # Layer-level only
+        mha_imp, ffn_imp, _, _ = compute_layer_importance_scores(
+            model, dataloader, device
+        )
+
+        # Fine-grained only
+        _, _, head_imp, neuron_imp = compute_layer_importance_scores(
+            model, dataloader, device,
+            compute_mha=False, compute_ffn=False,
+            compute_heads=True, compute_neurons=True
+        )
+
+        # All in one pass
+        mha_imp, ffn_imp, head_imp, neuron_imp = compute_layer_importance_scores(
+            model, dataloader, device,
+            compute_mha=True, compute_ffn=True,
+            compute_heads=True, compute_neurons=True
+        )
+    """
+    if not any([compute_mha, compute_ffn, compute_heads, compute_neurons]):
+        raise ValueError("Must compute at least one importance type")
+
+    n_layers = len(model.bert.encoder.layer)
+
+    # --- validate registered masks ---
+    for layer_idx, layer in enumerate(model.bert.encoder.layer):
+        if compute_mha and layer.attention is not None:
+            if not isinstance(layer.head_layer_mask_param, nn.Parameter):
+                raise ValueError(
+                    f"Layer {layer_idx}: head_layer_mask_param not registered. "
+                    f"Call register_layer_masks(..., register_mha_layer=True) first."
+                )
+        if compute_ffn and layer.intermediate is not None:
+            if not isinstance(layer.mlp_mask, nn.Parameter):
+                raise ValueError(
+                    f"Layer {layer_idx}: mlp_mask not registered. "
+                    f"Call register_layer_masks(..., register_mlp_layer=True) first."
+                )
+        if compute_heads and layer.attention is not None:
+            if layer.head_mask_param is None:
+                raise ValueError(
+                    f"Layer {layer_idx}: head_mask_param not registered. "
+                    f"Call register_layer_masks(..., register_mha=True) first."
+                )
+        if compute_neurons and layer.intermediate is not None:
+            if layer.int_mask_param is None:
+                raise ValueError(
+                    f"Layer {layer_idx}: int_mask_param not registered. "
+                    f"Call register_layer_masks(..., register_mlp=True) first."
+                )
+
+    # --- initialize accumulators ---
+    mha_importance    = torch.zeros(n_layers)          if compute_mha     else None
+    ffn_importance    = torch.zeros(n_layers)          if compute_ffn     else None
+
+    head_importance   = None
+    neuron_importance = None
+
+    if compute_heads:
+        head_importance = [
+            torch.zeros_like(layer.head_mask_param)
+            if layer.attention is not None and layer.head_mask_param is not None
+            else None
+            for layer in model.bert.encoder.layer
+        ]
+
+    if compute_neurons:
+        neuron_importance = [
+            torch.zeros_like(layer.int_mask_param)
+            if layer.intermediate is not None and layer.int_mask_param is not None
+            else None
+            for layer in model.bert.encoder.layer
+        ]
+
+    # --- describe what we're computing ---
+    active = []
+    if compute_mha:     active.append("MHA layer")
+    if compute_ffn:     active.append("FFN layer")
+    if compute_heads:   active.append("heads")
+    if compute_neurons: active.append("neurons")
+    desc = f"Computing importance ({', '.join(active)})"
+
+    n_batches = len(dataloader) if max_batches is None else min(len(dataloader), max_batches)
+    tot_tokens = 0.0
+
+    model.train()  # needed for scalar gate grads
+
+    for batch_idx, batch in enumerate(tqdm(dataloader, total=n_batches, desc=desc)):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
+
+        batch = {k: v.to(device) for k, v in batch.items()}
+        outputs = model(**batch)
+        outputs.loss.backward()
+
+        for layer_idx, layer in enumerate(model.bert.encoder.layer):
+
+            # layer-level MHA
+            if compute_mha and layer.attention is not None:
+                if layer.head_layer_mask_param.grad is not None:
+                    mha_importance[layer_idx] += layer.head_layer_mask_param.grad.abs().item()
+
+            # layer-level FFN
+            if compute_ffn and layer.intermediate is not None:
+                if layer.mlp_mask.grad is not None:
+                    ffn_importance[layer_idx] += layer.mlp_mask.grad.abs().item()
+
+            # fine-grained heads
+            if compute_heads and layer.attention is not None:
+                if layer.head_mask_param is not None and layer.head_mask_param.grad is not None:
+                    head_importance[layer_idx] += layer.head_mask_param.grad.abs().detach()
+
+            # fine-grained neurons
+            if compute_neurons and layer.intermediate is not None:
+                if layer.int_mask_param is not None and layer.int_mask_param.grad is not None:
+                    neuron_importance[layer_idx] += layer.int_mask_param.grad.abs().detach()
+
+        model.zero_grad()
+        tot_tokens += batch['attention_mask'].float().sum().item()
+
+    # --- normalize layer-level by tokens then by max → [0, 1] ---
+    if compute_mha:
+        mha_importance /= tot_tokens
+        mha_importance  = (mha_importance / mha_importance.max().clamp(min=1e-8)).numpy()
+
+    if compute_ffn:
+        ffn_importance /= tot_tokens
+        ffn_importance  = (ffn_importance / ffn_importance.max().clamp(min=1e-8)).numpy()
+
+    # --- normalize fine-grained by tokens only (keep per-head/neuron resolution) ---
+    if compute_heads:
+        for layer_idx in range(n_layers):
+            if head_importance[layer_idx] is not None:
+                head_importance[layer_idx] /= tot_tokens
+
+    if compute_neurons:
+        for layer_idx in range(n_layers):
+            if neuron_importance[layer_idx] is not None:
+                neuron_importance[layer_idx] /= tot_tokens
+
+    # --- summary table ---
+    print("\nLayer Importance Summary:")
+    header_parts = ["Layer"]
+    if compute_mha:     header_parts.append("MHA(layer)")
+    if compute_ffn:     header_parts.append("FFN(layer)")
+    if compute_heads:   header_parts.append("Heads(mean)")
+    if compute_neurons: header_parts.append("Neurons(mean)")
+    print("  " + "  ".join(f"{h:>13}" for h in header_parts))
+    print(f"  {'-' * (15 * len(header_parts))}")
+
+    for i in range(n_layers):
+        row = [f"{i:<13}"]
+        if compute_mha:
+            row.append(f"{mha_importance[i]:>13.4f}")
+        if compute_ffn:
+            row.append(f"{ffn_importance[i]:>13.4f}")
+        if compute_heads and head_importance[i] is not None:
+            row.append(f"{head_importance[i].mean().item():>13.4f}")
+        if compute_neurons and neuron_importance[i] is not None:
+            row.append(f"{neuron_importance[i].mean().item():>13.4f}")
+        print("  " + "  ".join(row))
+
+    return mha_importance, ffn_importance, head_importance, neuron_importance
 
 def remaining_layers_stat(model, component='head'):
     stats = []
