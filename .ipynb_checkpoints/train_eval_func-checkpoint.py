@@ -316,9 +316,9 @@ def get_recovery_epoch(task_name):
     large_datasets = ['qqp', 'qnli', 'sst2', 'mnli']
 
     if task_name in small_datasets:
-        return 3
+        return 10
     elif task_name in large_datasets:
-        return 1
+        return 3
 
 def iterative_cka_merge_and_train(
     model,
@@ -339,7 +339,9 @@ recovery_epochs=3,
     cka_max_iter=float("Inf"),
     teacher_model=None,
     alpha=0.5,
-    temperature=6
+    temperature=6,
+    regression=False,
+    validation_mismatched=None
 ):
     """
     Iteratively merge BERT layers using CKA similarity and recover performance.
@@ -424,7 +426,7 @@ recovery_epochs=3,
         
         # Evaluate Impacted Performance
         print("\n[3/5] Evaluating Post-Merge Performance...")
-        eval_metric = eval_loop(model, val_dataloader, task_name, device)[0]
+        eval_metric = eval_loop(model, val_dataloader, task_name, device, regression=regression)[0]
         print("  Metrics:")
         for metric_name, value in eval_metric.items():
             marker = "★" if metric_name == target_metric else " "
@@ -470,7 +472,8 @@ recovery_epochs=3,
                 lr_scheduler=lr_scheduler,
                 save_path=temp_save_path,
                 display_epoch_iter=True,
-                teacher_model=teacher_model, alpha=alpha, temperature=temperature
+                teacher_model=teacher_model, alpha=alpha, temperature=temperature,
+                regression=regression
             )
             
             # CRITICAL: Reload best checkpoint
@@ -481,6 +484,14 @@ recovery_epochs=3,
             print(f"  ✓ Loaded best checkpoint from epoch {best_checkpoint['epoch']}")
             print(f"    Best val loss: {best_checkpoint['val_loss']:.4f}")
             print(f"    Best val metrics: {best_checkpoint['val_metrics']}")
+
+            if validation_mismatched:
+                eval_metric = eval_loop(model, validation_mismatched, task_name, device)[0]
+                print("  Metrics for MNLI Mismatch:")
+                for metric_name, value in eval_metric.items():
+                    marker = "★" if metric_name == target_metric else " "
+                    print(f"    {marker} {metric_name}: {value:.4f}")
+                    
             
             merge_history['metrics_after_recovery'].append(best_checkpoint['val_metrics'])
             merge_history['training_stats'].append(train_stats)
@@ -489,6 +500,8 @@ recovery_epochs=3,
             if not keep_temp_checkpoints:
                 os.remove(temp_save_path)
                 print(f"  ✓ Cleaned up temporary checkpoint")
+
+            
 
             is_retrained = True
         else:

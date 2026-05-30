@@ -210,7 +210,111 @@ def merge_mha(model, sourceLayer, targetLayer,
     targetLayer.head_mask_param = nn.Parameter(
         torch.ones(n_head, dtype=torch.float32, device=device),
         requires_grad=True
-    )              
+    )
+
+def merge_mha_topk(model, sourceLayer, targetLayer,
+              source_head_imp_sorted,
+              target_head_imp_sorted,
+              device,
+              k_heads=0):
+
+    s_n_head = sourceLayer.attention.self.num_attention_heads
+    t_n_head = targetLayer.attention.self.num_attention_heads
+    head_size = sourceLayer.attention.self.attention_head_size
+
+    # ---------------------------
+    # Target stays intact
+    # Source contributes top-k heads
+    # ---------------------------
+    s_idx = min(k_heads, s_n_head)
+    t_idx = t_n_head
+
+    # Final number of heads
+    n_head = t_idx + s_idx
+    new_dim = n_head * head_size
+
+    print(f"Taking {s_idx} source heads")
+    print(f"Keeping {t_idx} target heads")
+
+    # Convert head count → dimension
+    s_len = s_idx * head_size
+    t_len = t_idx * head_size
+
+    # ---------------------------
+    # Resize layers FIRST
+    # ---------------------------
+    targetLayer.attention.self.query = resize_qkv(
+        targetLayer.attention.self.query,
+        new_dim
+    )
+
+    targetLayer.attention.self.key = resize_qkv(
+        targetLayer.attention.self.key,
+        new_dim
+    )
+
+    targetLayer.attention.self.value = resize_qkv(
+        targetLayer.attention.self.value,
+        new_dim
+    )
+
+    targetLayer.attention.output.dense = resize_output(
+        targetLayer.attention.output.dense,
+        new_dim
+    )
+
+    # ---------------------------
+    # Merge weights
+    # Target first, source appended
+    # ---------------------------
+    cw_helper(
+        sourceLayer.attention.self.query,
+        targetLayer.attention.self.query,
+        s_len,
+        t_len
+    )
+
+    cw_helper(
+        sourceLayer.attention.self.key,
+        targetLayer.attention.self.key,
+        s_len,
+        t_len
+    )
+
+    cw_helper(
+        sourceLayer.attention.self.value,
+        targetLayer.attention.self.value,
+        s_len,
+        t_len
+    )
+
+    cw_helper(
+        sourceLayer.attention.output.dense,
+        targetLayer.attention.output.dense,
+        s_len,
+        t_len,
+        dim=1
+    )
+
+    # ---------------------------
+    # Update config
+    # ---------------------------
+    targetLayer.attention.self.num_attention_heads = n_head
+    targetLayer.attention.self.all_head_size = new_dim
+
+    # ---------------------------
+    # Update head mask
+    # ---------------------------
+    targetLayer.head_mask_param = nn.Parameter(
+        torch.ones(
+            n_head,
+            dtype=torch.float32,
+            device=device
+        ),
+        requires_grad=True
+    )
+
+    return targetLayer
 
 def cw_ff_helper(sourceLinearLayer, targetLinearLayer, s_len, t_len, dim=0):
     with torch.no_grad():
@@ -333,3 +437,81 @@ def merge_ff(model, sourceLayer, targetLayer,
         torch.ones(f_dim, dtype=torch.float32, device=device),
         requires_grad=True
     )
+
+def merge_ff_topk(model,
+             sourceLayer,
+             targetLayer,
+             source_int_imp_sorted,
+             target_int_imp_sorted,
+             device,
+             k_neurons=0):
+
+    s_dim = sourceLayer.intermediate.dense.out_features
+    t_dim = targetLayer.intermediate.dense.out_features
+
+    # ---------------------------
+    # Target stays intact
+    # Source contributes top-k neurons
+    # ---------------------------
+    s_idx = min(k_neurons, s_dim)
+    t_idx = t_dim
+
+    # Final FFN dimension
+    f_dim = t_idx + s_idx
+
+    print(f"Taking {s_idx} source neurons")
+    print(f"Keeping {t_idx} target neurons")
+
+    s_len = s_idx
+    t_len = t_idx
+
+    # ---------------------------
+    # Resize layers FIRST
+    # ---------------------------
+    targetLayer.intermediate.dense = resize_ffn_intermediate(
+        targetLayer.intermediate.dense,
+        f_dim
+    )
+
+    targetLayer.output.dense = resize_ffn_output(
+        targetLayer.output.dense,
+        f_dim
+    )
+
+    # ---------------------------
+    # Merge weights
+    # Target first, source appended
+    # ---------------------------
+    cw_ff_helper(
+        sourceLayer.intermediate.dense,
+        targetLayer.intermediate.dense,
+        s_len,
+        t_len
+    )
+
+    cw_ff_helper(
+        sourceLayer.output.dense,
+        targetLayer.output.dense,
+        s_len,
+        t_len,
+        dim=1
+    )
+
+    # ---------------------------
+    # Update config
+    # ---------------------------
+    targetLayer.intermediate.dense.out_features = f_dim
+
+    # ---------------------------
+    # Update FFN mask
+    # ---------------------------
+    targetLayer.int_mask_param = nn.Parameter(
+        torch.ones(
+            f_dim,
+            dtype=torch.float32,
+            device=device
+        ),
+        requires_grad=True
+    )
+
+    return targetLayer
