@@ -118,7 +118,8 @@ def get_primary_metric(task_name):
 def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs=5, 
           lr=3e-5, patience=3, threshold=0.0, save_path=None, optimizer=None, 
           lr_scheduler=None, use_early_stopping=False, display_epoch_iter=False,
-          max_norm=0.05, benchmark="glue", regression=False, teacher_model=None, alpha=0.5, temperature=6):
+          max_norm=0.05, benchmark="glue", regression=False, teacher_model=None, alpha=0.5, 
+          temperature=6, student_layer_ids=None, teacher_layer_ids=None, gamma=0.3):
     """
     Train BERT model with optional early stopping and checkpoint saving.
     Automatically handles all GLUE task metrics.
@@ -207,6 +208,22 @@ def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs
                     F.log_softmax(outputs.logits / temperature, dim=-1),
                     F.softmax(outputs_teacher.logits / temperature, dim=-1)) * (temperature ** 2))
                 loss = alpha * loss + (1. - alpha) * loss_logits
+
+                if (student_layer_ids is not None) and (teacher_layer_ids is not None):
+                    hidden_loss = 0
+    
+                    for s, t in zip(student_layer_ids, teacher_layer_ids):
+                    
+                        student_hidden = outputs['hidden_states']['hidden_states'][s]
+                        teacher_hidden = outputs_teacher['hidden_states']['hidden_states'][t]
+                    
+                        hidden_loss += F.mse_loss(
+                            student_hidden,
+                            teacher_hidden
+                        )
+                    
+                    hidden_loss /= len(student_layer_ids)
+                    loss = loss + gamma * hidden_loss
             
             # Compute predictions
             if regression:

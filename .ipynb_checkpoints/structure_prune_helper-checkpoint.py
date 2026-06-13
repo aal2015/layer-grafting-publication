@@ -332,6 +332,8 @@ def compute_importance_scores(
     
     return head_importance, neuron_importance
 
+import numpy as np
+
 def compute_layer_importance_scores(
     model,
     dataloader,
@@ -341,18 +343,25 @@ def compute_layer_importance_scores(
     compute_ffn: bool = True,
     compute_heads: bool = False,
     compute_neurons: bool = False,
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], 
-           Optional[List[torch.Tensor]], Optional[List[torch.Tensor]]]:
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray],
+           Optional[List[torch.Tensor]], Optional[List[torch.Tensor]],
+           Optional[np.ndarray]]:
     """
     Compute importance scores at both layer-level and fine-grained level in a single pass.
     
     Layer-level (scalar gates):
-        head_layer_mask_param → mha_importance  : (n_layers,) normalized [0,1]
-        mlp_mask              → ffn_importance  : (n_layers,) normalized [0,1]
+        head_layer_mask_param → mha_importance  : (n_layers,) normalized [0,1] within MHA
+        mlp_mask              → ffn_importance  : (n_layers,) normalized [0,1] within FFN
     
     Fine-grained (vector gates):
-        head_mask_param  → head_importance  : List[(num_heads,)] per layer
-        int_mask_param   → neuron_importance: List[(intermediate_size,)] per layer
+        head_mask_param  → head_importance   : List[(num_heads,)] per layer
+        int_mask_param   → neuron_importance : List[(intermediate_size,)] per layer
+
+    Combined:
+        sublayer_importance: (n_layers * 2,) interleaved [MHA_0, FFN_0, MHA_1, FFN_1, ...]
+                             normalized [0,1] across ALL sublayers together using raw scores
+                             so MHA and FFN are on the same absolute scale.
+                             Only returned when both compute_mha and compute_ffn are True.
     
     Args:
         model           : BERT model with registered masks
@@ -365,24 +374,24 @@ def compute_layer_importance_scores(
         compute_neurons : Fine-grained per-neuron importance
 
     Returns:
-        (mha_importance, ffn_importance, head_importance, neuron_importance)
+        (mha_importance, ffn_importance, head_importance, neuron_importance, sublayer_importance)
         Any disabled component returns None.
 
     Examples:
         # Layer-level only
-        mha_imp, ffn_imp, _, _ = compute_layer_importance_scores(
+        mha_imp, ffn_imp, _, _, sub_imp = compute_layer_importance_scores(
             model, dataloader, device
         )
 
         # Fine-grained only
-        _, _, head_imp, neuron_imp = compute_layer_importance_scores(
+        _, _, head_imp, neuron_imp, _ = compute_layer_importance_scores(
             model, dataloader, device,
             compute_mha=False, compute_ffn=False,
             compute_heads=True, compute_neurons=True
         )
 
         # All in one pass
-        mha_imp, ffn_imp, head_imp, neuron_imp = compute_layer_importance_scores(
+        mha_imp, ffn_imp, head_imp, neuron_imp, sub_imp = compute_layer_importance_scores(
             model, dataloader, device,
             compute_mha=True, compute_ffn=True,
             compute_heads=True, compute_neurons=True
@@ -421,9 +430,8 @@ def compute_layer_importance_scores(
                 )
 
     # --- initialize accumulators ---
-    mha_importance    = torch.zeros(n_layers)          if compute_mha     else None
-    ffn_importance    = torch.zeros(n_layers)          if compute_ffn     else None
-
+    mha_importance    = torch.zeros(n_layers) if compute_mha     else None
+    ffn_importance    = torch.zeros(n_layers) if compute_ffn     else None
     head_importance   = None
     neuron_importance = None
 
@@ -451,10 +459,10 @@ def compute_layer_importance_scores(
     if compute_neurons: active.append("neurons")
     desc = f"Computing importance ({', '.join(active)})"
 
-    n_batches = len(dataloader) if max_batches is None else min(len(dataloader), max_batches)
+    n_batches  = len(dataloader) if max_batches is None else min(len(dataloader), max_batches)
     tot_tokens = 0.0
 
-    model.train()  # needed for scalar gate grads
+    model.train()
 
     for batch_idx, batch in enumerate(tqdm(dataloader, total=n_batches, desc=desc)):
         if max_batches is not None and batch_idx >= max_batches:
@@ -465,23 +473,18 @@ def compute_layer_importance_scores(
         outputs.loss.backward()
 
         for layer_idx, layer in enumerate(model.bert.encoder.layer):
-
-            # layer-level MHA
             if compute_mha and layer.attention is not None:
                 if layer.head_layer_mask_param.grad is not None:
                     mha_importance[layer_idx] += layer.head_layer_mask_param.grad.abs().item()
 
-            # layer-level FFN
             if compute_ffn and layer.intermediate is not None:
                 if layer.mlp_mask.grad is not None:
                     ffn_importance[layer_idx] += layer.mlp_mask.grad.abs().item()
 
-            # fine-grained heads
             if compute_heads and layer.attention is not None:
                 if layer.head_mask_param is not None and layer.head_mask_param.grad is not None:
                     head_importance[layer_idx] += layer.head_mask_param.grad.abs().detach()
 
-            # fine-grained neurons
             if compute_neurons and layer.intermediate is not None:
                 if layer.int_mask_param is not None and layer.int_mask_param.grad is not None:
                     neuron_importance[layer_idx] += layer.int_mask_param.grad.abs().detach()
@@ -489,16 +492,21 @@ def compute_layer_importance_scores(
         model.zero_grad()
         tot_tokens += batch['attention_mask'].float().sum().item()
 
-    # --- normalize layer-level by tokens then by max → [0, 1] ---
+    # --- normalize by tokens → raw absolute sensitivity ---
+    mha_importance_raw = None
+    ffn_importance_raw = None
+
     if compute_mha:
-        mha_importance /= tot_tokens
-        mha_importance  = (mha_importance / mha_importance.max().clamp(min=1e-8)).numpy()
+        mha_importance    /= tot_tokens
+        mha_importance_raw = mha_importance.clone().numpy()
+        mha_importance     = (mha_importance / mha_importance.max().clamp(min=1e-8)).numpy()
 
     if compute_ffn:
-        ffn_importance /= tot_tokens
-        ffn_importance  = (ffn_importance / ffn_importance.max().clamp(min=1e-8)).numpy()
+        ffn_importance    /= tot_tokens
+        ffn_importance_raw = ffn_importance.clone().numpy()
+        ffn_importance     = (ffn_importance / ffn_importance.max().clamp(min=1e-8)).numpy()
 
-    # --- normalize fine-grained by tokens only (keep per-head/neuron resolution) ---
+    # --- normalize fine-grained by tokens only ---
     if compute_heads:
         for layer_idx in range(n_layers):
             if head_importance[layer_idx] is not None:
@@ -509,8 +517,20 @@ def compute_layer_importance_scores(
             if neuron_importance[layer_idx] is not None:
                 neuron_importance[layer_idx] /= tot_tokens
 
-    # --- summary table ---
-    print("\nLayer Importance Summary:")
+    # --- combined sublayer importance ---
+    # concatenate raw scores then normalize once so MHA and FFN
+    # are on the same absolute scale and genuinely comparable
+    sublayer_importance = None
+    if compute_mha and compute_ffn:
+        combined_raw = np.zeros(n_layers * 2)
+        for i in range(n_layers):
+            combined_raw[i * 2]     = mha_importance_raw[i]   # MHA_i
+            combined_raw[i * 2 + 1] = ffn_importance_raw[i]   # FFN_i
+
+        sublayer_importance = combined_raw / combined_raw.max().clip(min=1e-8)
+
+    # --- separate display ---
+    print("\nLayer Importance Summary (separate):")
     header_parts = ["Layer"]
     if compute_mha:     header_parts.append("MHA(layer)")
     if compute_ffn:     header_parts.append("FFN(layer)")
@@ -518,7 +538,6 @@ def compute_layer_importance_scores(
     if compute_neurons: header_parts.append("Neurons(mean)")
     print("  " + "  ".join(f"{h:>13}" for h in header_parts))
     print(f"  {'-' * (15 * len(header_parts))}")
-
     for i in range(n_layers):
         row = [f"{i:<13}"]
         if compute_mha:
@@ -531,7 +550,28 @@ def compute_layer_importance_scores(
             row.append(f"{neuron_importance[i].mean().item():>13.4f}")
         print("  " + "  ".join(row))
 
-    return mha_importance, ffn_importance, head_importance, neuron_importance
+    # --- combined display ---
+    if sublayer_importance is not None:
+        print("\nSublayer Importance Summary (combined, raw-normalized):")
+        print(f"  {'Sublayer':<12} {'Type':<8} {'Layer':<8} {'Score':>10}")
+        print(f"  {'-' * 40}")
+        for k in range(n_layers * 2):
+            layer_idx = k // 2
+            stype     = "MHA" if k % 2 == 0 else "FFN"
+            score     = sublayer_importance[k]
+            label     = f"{stype}_{layer_idx}"
+            print(f"  {label:<12} {stype:<8} {layer_idx:<8} {score:>10.4f}")
+
+        # pruning order hint
+        print("\n  Pruning order (lowest → highest importance):")
+        pruning_order = np.argsort(sublayer_importance)
+        for rank, k in enumerate(pruning_order):
+            layer_idx = k // 2
+            stype     = "MHA" if k % 2 == 0 else "FFN"
+            print(f"    Rank {rank+1:>2}: {stype}_L{layer_idx} "
+                  f"score={sublayer_importance[k]:.4f}")
+
+    return mha_importance, ffn_importance, head_importance, neuron_importance, sublayer_importance
 
 def remaining_layers_stat(model, component='head'):
     stats = []
