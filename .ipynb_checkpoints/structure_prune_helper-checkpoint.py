@@ -343,6 +343,9 @@ def compute_layer_importance_scores(
     compute_ffn: bool = True,
     compute_heads: bool = False,
     compute_neurons: bool = False,
+    display_separate: bool = True,
+    display_combined: bool = True,
+    display_pruning_order: bool = True,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray],
            Optional[List[torch.Tensor]], Optional[List[torch.Tensor]],
            Optional[np.ndarray]]:
@@ -364,37 +367,41 @@ def compute_layer_importance_scores(
                              Only returned when both compute_mha and compute_ffn are True.
     
     Args:
-        model           : BERT model with registered masks
-        dataloader      : Dataloader for importance computation
-        device          : torch device
-        max_batches     : Limit batches (None = use all)
-        compute_mha     : Layer-level MHA importance via scalar gate
-        compute_ffn     : Layer-level FFN importance via scalar gate
-        compute_heads   : Fine-grained per-head importance
-        compute_neurons : Fine-grained per-neuron importance
+        model                : BERT model with registered masks
+        dataloader           : Dataloader for importance computation
+        device               : torch device
+        max_batches          : Limit batches (None = use all)
+        compute_mha          : Layer-level MHA importance via scalar gate
+        compute_ffn          : Layer-level FFN importance via scalar gate
+        compute_heads        : Fine-grained per-head importance
+        compute_neurons      : Fine-grained per-neuron importance
+        display_separate     : Print per-layer MHA/FFN/heads/neurons table (default: True)
+        display_combined     : Print interleaved sublayer importance table (default: True)
+        display_pruning_order: Print ranked pruning order (default: True)
+                               Only shown when display_combined=True and sublayer_importance exists
 
     Returns:
         (mha_importance, ffn_importance, head_importance, neuron_importance, sublayer_importance)
         Any disabled component returns None.
 
     Examples:
-        # Layer-level only
+        # All displays on (default)
         mha_imp, ffn_imp, _, _, sub_imp = compute_layer_importance_scores(
             model, dataloader, device
         )
 
-        # Fine-grained only
-        _, _, head_imp, neuron_imp, _ = compute_layer_importance_scores(
+        # Silent — no display
+        mha_imp, ffn_imp, _, _, sub_imp = compute_layer_importance_scores(
             model, dataloader, device,
-            compute_mha=False, compute_ffn=False,
-            compute_heads=True, compute_neurons=True
+            display_separate=False, display_combined=False
         )
 
-        # All in one pass
-        mha_imp, ffn_imp, head_imp, neuron_imp, sub_imp = compute_layer_importance_scores(
+        # Combined only, no pruning order
+        mha_imp, ffn_imp, _, _, sub_imp = compute_layer_importance_scores(
             model, dataloader, device,
-            compute_mha=True, compute_ffn=True,
-            compute_heads=True, compute_neurons=True
+            display_separate=False,
+            display_combined=True,
+            display_pruning_order=False
         )
     """
     if not any([compute_mha, compute_ffn, compute_heads, compute_neurons]):
@@ -518,40 +525,38 @@ def compute_layer_importance_scores(
                 neuron_importance[layer_idx] /= tot_tokens
 
     # --- combined sublayer importance ---
-    # concatenate raw scores then normalize once so MHA and FFN
-    # are on the same absolute scale and genuinely comparable
     sublayer_importance = None
     if compute_mha and compute_ffn:
         combined_raw = np.zeros(n_layers * 2)
         for i in range(n_layers):
-            combined_raw[i * 2]     = mha_importance_raw[i]   # MHA_i
-            combined_raw[i * 2 + 1] = ffn_importance_raw[i]   # FFN_i
-
+            combined_raw[i * 2]     = mha_importance_raw[i]
+            combined_raw[i * 2 + 1] = ffn_importance_raw[i]
         sublayer_importance = combined_raw / combined_raw.max().clip(min=1e-8)
 
     # --- separate display ---
-    print("\nLayer Importance Summary (separate):")
-    header_parts = ["Layer"]
-    if compute_mha:     header_parts.append("MHA(layer)")
-    if compute_ffn:     header_parts.append("FFN(layer)")
-    if compute_heads:   header_parts.append("Heads(mean)")
-    if compute_neurons: header_parts.append("Neurons(mean)")
-    print("  " + "  ".join(f"{h:>13}" for h in header_parts))
-    print(f"  {'-' * (15 * len(header_parts))}")
-    for i in range(n_layers):
-        row = [f"{i:<13}"]
-        if compute_mha:
-            row.append(f"{mha_importance[i]:>13.4f}")
-        if compute_ffn:
-            row.append(f"{ffn_importance[i]:>13.4f}")
-        if compute_heads and head_importance[i] is not None:
-            row.append(f"{head_importance[i].mean().item():>13.4f}")
-        if compute_neurons and neuron_importance[i] is not None:
-            row.append(f"{neuron_importance[i].mean().item():>13.4f}")
-        print("  " + "  ".join(row))
+    if display_separate:
+        print("\nLayer Importance Summary (separate):")
+        header_parts = ["Layer"]
+        if compute_mha:     header_parts.append("MHA(layer)")
+        if compute_ffn:     header_parts.append("FFN(layer)")
+        if compute_heads:   header_parts.append("Heads(mean)")
+        if compute_neurons: header_parts.append("Neurons(mean)")
+        print("  " + "  ".join(f"{h:>13}" for h in header_parts))
+        print(f"  {'-' * (15 * len(header_parts))}")
+        for i in range(n_layers):
+            row = [f"{i:<13}"]
+            if compute_mha:
+                row.append(f"{mha_importance[i]:>13.4f}")
+            if compute_ffn:
+                row.append(f"{ffn_importance[i]:>13.4f}")
+            if compute_heads and head_importance[i] is not None:
+                row.append(f"{head_importance[i].mean().item():>13.4f}")
+            if compute_neurons and neuron_importance[i] is not None:
+                row.append(f"{neuron_importance[i].mean().item():>13.4f}")
+            print("  " + "  ".join(row))
 
     # --- combined display ---
-    if sublayer_importance is not None:
+    if display_combined and sublayer_importance is not None:
         print("\nSublayer Importance Summary (combined, raw-normalized):")
         print(f"  {'Sublayer':<12} {'Type':<8} {'Layer':<8} {'Score':>10}")
         print(f"  {'-' * 40}")
@@ -562,14 +567,14 @@ def compute_layer_importance_scores(
             label     = f"{stype}_{layer_idx}"
             print(f"  {label:<12} {stype:<8} {layer_idx:<8} {score:>10.4f}")
 
-        # pruning order hint
-        print("\n  Pruning order (lowest → highest importance):")
-        pruning_order = np.argsort(sublayer_importance)
-        for rank, k in enumerate(pruning_order):
-            layer_idx = k // 2
-            stype     = "MHA" if k % 2 == 0 else "FFN"
-            print(f"    Rank {rank+1:>2}: {stype}_L{layer_idx} "
-                  f"score={sublayer_importance[k]:.4f}")
+        if display_pruning_order:
+            print("\n  Pruning order (lowest → highest importance):")
+            pruning_order = np.argsort(sublayer_importance)
+            for rank, k in enumerate(pruning_order):
+                layer_idx = k // 2
+                stype     = "MHA" if k % 2 == 0 else "FFN"
+                print(f"    Rank {rank+1:>2}: {stype}_L{layer_idx} "
+                      f"score={sublayer_importance[k]:.4f}")
 
     return mha_importance, ffn_importance, head_importance, neuron_importance, sublayer_importance
 
