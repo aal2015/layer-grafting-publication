@@ -887,3 +887,132 @@ def test_merge_mha_cluster(model, layer_indices, target_idx, k_per_layer, device
     print("="*60)
 
     return all_passed
+
+
+def merge_mha_addon(
+    host_layer,
+    donor_layer,
+    donor_heads,
+    device,
+):
+    """
+    Add the top-k attention heads from donor_layer into host_layer.
+
+    Assumptions
+    ----------
+    donor_layer heads are already sorted by importance descending.
+    First `donor_heads` heads are the most important.
+
+    host_layer is the fixed foundation — its weights are fully preserved.
+    donor_layer is the contributor — top-k heads appended after host heads.
+
+    Parameters
+    ----------
+    host_layer   : BertLayer — fixed, receives donor heads
+    donor_layer  : BertLayer — pre-sorted, contributes top-k heads
+    donor_heads  : int — number of donor heads to append
+    device       : torch device
+    """
+    if donor_heads == 0:
+        print("  donor_heads=0, nothing to merge")
+        return
+
+    head_size     = host_layer.attention.self.attention_head_size
+    host_n_heads  = host_layer.attention.self.num_attention_heads
+    donor_n_heads = donor_layer.attention.self.num_attention_heads
+
+    # clamp to available donor heads
+    donor_heads = min(donor_heads, donor_n_heads)
+
+    host_dim  = host_n_heads  * head_size
+    donor_dim = donor_heads   * head_size
+    new_dim   = host_dim + donor_dim
+
+    print(f"  host heads={host_n_heads}, donor heads={donor_heads}, "
+          f"total={host_n_heads + donor_heads}")
+
+    # --------------------------------------------------------
+    # Save original host weights BEFORE resize
+    # --------------------------------------------------------
+    old_query  = host_layer.attention.self.query
+    old_key    = host_layer.attention.self.key
+    old_value  = host_layer.attention.self.value
+    old_output = host_layer.attention.output.dense
+
+    # clone weights to survive the resize
+    old_q_w = old_query.weight.data.clone()
+    old_q_b = old_query.bias.data.clone()
+    old_k_w = old_key.weight.data.clone()
+    old_k_b = old_key.bias.data.clone()
+    old_v_w = old_value.weight.data.clone()
+    old_v_b = old_value.bias.data.clone()
+    old_o_w = old_output.weight.data.clone()
+    old_o_b = old_output.bias.data.clone()
+
+    # --------------------------------------------------------
+    # Resize host layers
+    # --------------------------------------------------------
+    host_layer.attention.self.query        = resize_qkv(old_query, new_dim)
+    host_layer.attention.self.key          = resize_qkv(old_key, new_dim)
+    host_layer.attention.self.value        = resize_qkv(old_value, new_dim)
+    host_layer.attention.output.dense      = resize_output(old_output, new_dim)
+
+    # --------------------------------------------------------
+    # Write: host weights first, donor appended after
+    # --------------------------------------------------------
+    with torch.no_grad():
+
+        # --- Query ---
+        host_layer.attention.self.query.weight.data[:host_dim]  = old_q_w
+        host_layer.attention.self.query.bias.data[:host_dim]    = old_q_b
+        host_layer.attention.self.query.weight.data[host_dim:]  = \
+            donor_layer.attention.self.query.weight.data[:donor_dim]
+        host_layer.attention.self.query.bias.data[host_dim:]    = \
+            donor_layer.attention.self.query.bias.data[:donor_dim]
+
+        # --- Key ---
+        host_layer.attention.self.key.weight.data[:host_dim]    = old_k_w
+        host_layer.attention.self.key.bias.data[:host_dim]      = old_k_b
+        host_layer.attention.self.key.weight.data[host_dim:]    = \
+            donor_layer.attention.self.key.weight.data[:donor_dim]
+        host_layer.attention.self.key.bias.data[host_dim:]      = \
+            donor_layer.attention.self.key.bias.data[:donor_dim]
+
+        # --- Value ---
+        host_layer.attention.self.value.weight.data[:host_dim]  = old_v_w
+        host_layer.attention.self.value.bias.data[:host_dim]    = old_v_b
+        host_layer.attention.self.value.weight.data[host_dim:]  = \
+            donor_layer.attention.self.value.weight.data[:donor_dim]
+        host_layer.attention.self.value.bias.data[host_dim:]    = \
+            donor_layer.attention.self.value.bias.data[:donor_dim]
+
+        # --- Output projection (column-wise) ---
+        host_layer.attention.output.dense.weight.data[:, :host_dim]  = old_o_w
+        host_layer.attention.output.dense.weight.data[:, host_dim:]  = \
+            donor_layer.attention.output.dense.weight.data[:, :donor_dim]
+        host_layer.attention.output.dense.bias.data.copy_(old_o_b)   # bias unchanged
+
+    # --------------------------------------------------------
+    # Update config
+    # --------------------------------------------------------
+    host_layer.attention.self.num_attention_heads = host_n_heads + donor_heads
+    host_layer.attention.self.all_head_size        = new_dim
+
+    # --------------------------------------------------------
+    # Update head_mask_param
+    # --------------------------------------------------------
+    with torch.no_grad():
+        if hasattr(host_layer, 'head_mask_param') and \
+           host_layer.head_mask_param is not None:
+            old_mask = host_layer.head_mask_param.data.to(device)  # fix device
+            new_mask = torch.ones(
+                host_n_heads + donor_heads,
+                dtype=torch.float32,
+                device=device
+            )
+            new_mask[:host_n_heads] = old_mask
+            host_layer.head_mask_param = nn.Parameter(
+                new_mask, requires_grad=True
+            )
+
+    print(f"  Done: host now has {host_layer.attention.self.num_attention_heads} heads")
