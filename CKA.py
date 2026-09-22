@@ -281,3 +281,119 @@ class CKAEvaluator:
         sub_similarity  = sub_similarity  / num_steps
     
         return reps_similarity, atts_similarity, sub_similarity
+
+
+class SentenceCKARedundancy:
+    def __init__(self, device):
+        self.cuda_cka = CudaCKA(device)
+ 
+    # ------------------------------------------------------------------
+    # Collection: slice out (layer, head) attention matrices, unflattened
+    # ------------------------------------------------------------------
+    def collect_selected_layer_head_matrices(self, atts, layer_indices):
+        """
+        atts: list of length L, each (batch, heads, seq_q, seq_k)
+        layer_indices: which layers to include (e.g. [3], [0,1,2], or
+                       list(range(L)) for all layers)
+ 
+        Returns:
+            matrices: list of (batch, seq_q, seq_k) tensors, UNFLATTENED.
+                      Sentence-level CKA needs the (n, n) shape intact --
+                      do not flatten these.
+            labels: list of (layer_idx, head_idx) tuples, same order/length
+                    as matrices. Required to interpret rows/cols of the
+                    returned similarity matrix once more than one layer
+                    is involved.
+        """
+        matrices = []
+        labels = []
+        for layer_idx in layer_indices:
+            layer_att = atts[layer_idx]  # (batch, heads, seq_q, seq_k)
+            heads = layer_att.shape[1]
+            for h in range(heads):
+                matrices.append(layer_att[:, h, :, :])
+                labels.append((layer_idx, h))
+        return matrices, labels
+ 
+    # ------------------------------------------------------------------
+    # Core computation
+    # ------------------------------------------------------------------
+    def sentence_cka_head_matrix(self, atts, attention_mask, layer_indices):
+        """
+        General entry point for sentence-level CKA over selected
+        (layer, head) pairs. Works for a single layer, an arbitrary
+        selection, or all layers -- controlled entirely by layer_indices.
+ 
+        atts: list of length L, each (batch, heads, seq_q, seq_k)
+        attention_mask: (batch, seq_q), 1 for real tokens, 0 for padding.
+                         Handles left- or right-padding correctly (does
+                         not assume padding position).
+        layer_indices: list of layer indices to include.
+ 
+        Returns:
+            scores: (M, M) numpy array, M = len(layer_indices) * heads
+            labels: list of (layer_idx, head_idx), same order as rows/cols
+        """
+        matrices, labels = self.collect_selected_layer_head_matrices(atts, layer_indices)
+        M = len(matrices)
+        batch = matrices[0].shape[0]
+        device = matrices[0].device
+ 
+        scores = torch.zeros(M, M, device=device)
+ 
+        with torch.no_grad():
+            for b in range(batch):
+                # Padding-side agnostic: pick out exactly the valid token
+                # positions for this sentence, wherever they are.
+                valid_idx = attention_mask[b].bool()
+                n_valid = int(valid_idx.sum().item())
+ 
+                # Guard against degenerate very-short sentences where
+                # linear_CKA's variance terms can be ~0 -> NaN.
+                if n_valid < 2:
+                    continue
+ 
+                for i in range(M):
+                    Ai = matrices[i][b][valid_idx][:, valid_idx]  # (n_valid, n_valid)
+                    for j in range(i, M):
+                        Bj = matrices[j][b][valid_idx][:, valid_idx]
+                        val = self.cuda_cka.linear_CKA(Ai, Bj).detach()
+                        scores[i, j] += val
+                        if i != j:
+                            scores[j, i] += val
+ 
+        scores = scores / batch
+        return scores.cpu().numpy(), labels
+ 
+    # ------------------------------------------------------------------
+    # Thin wrappers -- all reuse the same core function
+    # ------------------------------------------------------------------
+    def head_to_head_single_layer(self, atts, attention_mask, layer_idx):
+        """One layer, all its heads compared against each other. (heads x heads)."""
+        return self.sentence_cka_head_matrix(atts, attention_mask, layer_indices=[layer_idx])
+ 
+    def head_to_head_layer_selection(self, atts, attention_mask, layer_indices):
+        """Arbitrary subset of layers; all heads within them compared globally."""
+        return self.sentence_cka_head_matrix(atts, attention_mask, layer_indices=layer_indices)
+ 
+    def head_to_head_global_all_layers(self, atts, attention_mask):
+        """
+        Every layer, every head, compared globally against every other
+        (layer, head) pair -- including across different layers.
+        Reuses the selection path with the full index range.
+        """
+        all_layers = list(range(len(atts)))
+        return self.sentence_cka_head_matrix(atts, attention_mask, layer_indices=all_layers)
+ 
+    def head_to_head_per_layer_all(self, atts, attention_mask):
+        """
+        Every layer, but heads compared ONLY within their own layer
+        (i.e. a list of independent heads x heads matrices, one per layer --
+        NOT a single global matrix). Use this if you want per-layer
+        diagnostics rather than cross-layer head comparison.
+        """
+        results = []
+        for layer_idx in range(len(atts)):
+            scores, labels = self.head_to_head_single_layer(atts, attention_mask, layer_idx)
+            results.append({"layer": layer_idx, "scores": scores, "labels": labels})
+        return results

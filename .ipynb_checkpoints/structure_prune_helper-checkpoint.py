@@ -82,6 +82,83 @@ def register_importance_masks(model, device,
         print(f"  Layer {layer_idx}: Registered ({', '.join(parts)})")
 
     return model
+
+def reset_importance_masks(model,
+                           reset_mha=True, reset_mlp=True,
+                           reset_mha_layer=True, reset_mlp_layer=True, display_print=True):
+    """
+    Reset importance masks back to ones (identity) after computation.
+    Automatically adjusts mask sizes to match current layer dimensions
+    in case heads or neurons changed due to merging.
+    """
+    if not any([reset_mha, reset_mlp, reset_mha_layer, reset_mlp_layer]):
+        raise ValueError("Must reset at least one mask type")
+
+    for layer_idx, layer in enumerate(model.bert.encoder.layer):
+        parts = []
+
+        # --- reset per-head mask ---
+        if reset_mha:
+            if hasattr(layer, 'head_mask_param') and layer.head_mask_param is not None:
+                if layer.attention is not None:
+                    current_n_heads = layer.attention.self.num_attention_heads
+                    if layer.head_mask_param.shape[0] != current_n_heads:
+                        # size mismatch — re-register to match current head count
+                        layer.head_mask_param = nn.Parameter(
+                            torch.ones(current_n_heads, dtype=torch.float32,
+                                       device=layer.head_mask_param.device),
+                            requires_grad=True
+                        )
+                        parts.append(f"head_mask_param resized → {current_n_heads} heads")
+                    else:
+                        with torch.no_grad():
+                            layer.head_mask_param.fill_(1.0)
+                        layer.head_mask_param.grad = None
+                        parts.append(f"head_mask_param reset ({current_n_heads} heads)")
+
+        # --- reset per-neuron mask ---
+        if reset_mlp:
+            if hasattr(layer, 'int_mask_param') and layer.int_mask_param is not None:
+                if layer.intermediate is not None:
+                    current_ffn_dim = layer.intermediate.dense.out_features
+                    if layer.int_mask_param.shape[0] != current_ffn_dim:
+                        # size mismatch — re-register to match current neuron count
+                        layer.int_mask_param = nn.Parameter(
+                            torch.ones(current_ffn_dim, dtype=torch.float32,
+                                       device=layer.int_mask_param.device),
+                            requires_grad=True
+                        )
+                        parts.append(f"int_mask_param resized → {current_ffn_dim} neurons")
+                    else:
+                        with torch.no_grad():
+                            layer.int_mask_param.fill_(1.0)
+                        layer.int_mask_param.grad = None
+                        parts.append(f"int_mask_param reset ({current_ffn_dim} neurons)")
+
+        # --- reset scalar MHA gate ---
+        if reset_mha_layer:
+            if hasattr(layer, 'head_layer_mask_param') and \
+               layer.head_layer_mask_param is not None:
+                with torch.no_grad():
+                    layer.head_layer_mask_param.fill_(1.0)
+                layer.head_layer_mask_param.grad = None
+                parts.append("head_layer_mask_param")
+
+        # --- reset scalar FFN gate ---
+        if reset_mlp_layer:
+            if hasattr(layer, 'mlp_mask') and layer.mlp_mask is not None:
+                with torch.no_grad():
+                    layer.mlp_mask.fill_(1.0)
+                layer.mlp_mask.grad = None
+                parts.append("mlp_mask")
+
+        if display_print:
+            if parts:
+                print(f"  Layer {layer_idx}: {', '.join(parts)}")
+            else:
+                print(f"  Layer {layer_idx}: nothing to reset")
+
+    return model
  
  
 def remove_importance_masks(model, remove_heads=True, remove_ffn=True, remove_mha=True, remove_mlp=True):

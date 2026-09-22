@@ -2,7 +2,7 @@ import torch
 
 #### Ordering Functions
 
-def reorder_merged_layer_heads(merged_layer, head_importance, device):
+def reorder_merged_layer_heads(merged_layer, head_importance, device, display=True):
     """
     Reorder heads in merged layer so most important are first.
     
@@ -69,10 +69,11 @@ def reorder_merged_layer_heads(merged_layer, head_importance, device):
             requires_grad=True
         )
 
-    print(f"Reordered {n_heads} heads, new order: {sorted_head_indices.tolist()}")
+    if display:
+        print(f"Reordered {n_heads} heads, new order: {sorted_head_indices.tolist()}")
     return merged_layer
 
-def reorder_layer_neurons(layer, neuron_importance, device):
+def reorder_layer_neurons(layer, neuron_importance, device, display=True):
     """
     Reorder FFN neurons in ANY BertLayer so most important are first.
     Works for both original and merged (variable width) layers.
@@ -131,7 +132,9 @@ def reorder_layer_neurons(layer, neuron_importance, device):
             requires_grad=True
         )
 
-    print(f"  Reordered {ffn_dim} neurons")
+    if display:
+        print(f"  Reordered {ffn_dim} neurons")
+    
     return layer
 
 #### Layer Composition 
@@ -894,6 +897,7 @@ def merge_mha_addon(
     donor_layer,
     donor_heads,
     device,
+    display_print=True
 ):
     """
     Add the top-k attention heads from donor_layer into host_layer.
@@ -1015,4 +1019,114 @@ def merge_mha_addon(
                 new_mask, requires_grad=True
             )
 
-    print(f"  Done: host now has {host_layer.attention.self.num_attention_heads} heads")
+    if display_print:
+        print(f"  Done: host now has {host_layer.attention.self.num_attention_heads} heads")
+
+
+def merge_ffn_addon(
+    host_layer,
+    donor_layer,
+    donor_neurons,
+    device,
+    display_print=True
+):
+    """
+    Add the top-k FFN neurons from donor_layer into host_layer.
+
+    Assumptions
+    -----------
+    donor_layer neurons are already sorted by importance descending.
+    First `donor_neurons` neurons are therefore the most important.
+
+    host_layer is the fixed foundation — its weights fully preserved.
+    donor_layer is the contributor — top-k neurons appended after host neurons.
+
+    Parameters
+    ----------
+    host_layer    : BertLayer — fixed, receives donor neurons
+    donor_layer   : BertLayer — pre-sorted, contributes top-k neurons
+    donor_neurons : int — number of donor neurons to append
+    device        : torch device
+    """
+    if donor_neurons == 0:
+        print("  donor_neurons=0, nothing to merge")
+        return
+
+    host_dim  = host_layer.intermediate.dense.out_features
+    donor_dim = donor_layer.intermediate.dense.out_features
+
+    # clamp to available donor neurons
+    donor_neurons = min(donor_neurons, donor_dim)
+    new_dim       = host_dim + donor_neurons
+
+    print(f"  host neurons={host_dim}, donor neurons={donor_neurons}, "
+          f"total={new_dim}")
+
+    # --------------------------------------------------------
+    # Save original host weights BEFORE resize
+    # --------------------------------------------------------
+    old_w1   = host_layer.intermediate.dense.weight.data.clone()  # (host_dim, hidden)
+    old_b1   = host_layer.intermediate.dense.bias.data.clone()    # (host_dim,)
+    old_w2   = host_layer.output.dense.weight.data.clone()        # (hidden, host_dim)
+    old_b2   = host_layer.output.dense.bias.data.clone()          # (hidden,)
+    old_ln_w = host_layer.output.LayerNorm.weight.data.clone()
+    old_ln_b = host_layer.output.LayerNorm.bias.data.clone()
+
+    # --------------------------------------------------------
+    # Resize host FFN layers
+    # --------------------------------------------------------
+    host_layer.intermediate.dense = resize_ffn_intermediate(
+        host_layer.intermediate.dense, new_dim
+    )
+    host_layer.output.dense = resize_ffn_output(
+        host_layer.output.dense, new_dim
+    )
+
+    # --------------------------------------------------------
+    # Write: host neurons first, donor appended after
+    # --------------------------------------------------------
+    with torch.no_grad():
+
+        # --- W1 (intermediate): row-wise ---
+        # host rows first
+        host_layer.intermediate.dense.weight.data[:host_dim]  = old_w1
+        host_layer.intermediate.dense.bias.data[:host_dim]    = old_b1
+        # donor rows appended
+        host_layer.intermediate.dense.weight.data[host_dim:]  = \
+            donor_layer.intermediate.dense.weight.data[:donor_neurons]
+        host_layer.intermediate.dense.bias.data[host_dim:]    = \
+            donor_layer.intermediate.dense.bias.data[:donor_neurons]
+
+        # --- W2 (output): column-wise ---
+        # host columns first
+        host_layer.output.dense.weight.data[:, :host_dim]     = old_w2
+        # donor columns appended
+        host_layer.output.dense.weight.data[:, host_dim:]     = \
+            donor_layer.output.dense.weight.data[:, :donor_neurons]
+        # output bias preserved from host (not per-neuron)
+        host_layer.output.dense.bias.data.copy_(old_b2)
+
+        # --- LayerNorm: preserved from host ---
+        host_layer.output.LayerNorm.weight.data.copy_(old_ln_w)
+        host_layer.output.LayerNorm.bias.data.copy_(old_ln_b)
+
+    # --------------------------------------------------------
+    # Update config
+    # --------------------------------------------------------
+    host_layer.intermediate.dense.out_features = new_dim
+
+    # --------------------------------------------------------
+    # Update int_mask_param
+    # --------------------------------------------------------
+    with torch.no_grad():
+        if hasattr(host_layer, 'int_mask_param') and \
+           host_layer.int_mask_param is not None:
+            old_mask = host_layer.int_mask_param.data.to(device)
+            new_mask = torch.ones(new_dim, dtype=torch.float32, device=device)
+            new_mask[:host_dim] = old_mask   # preserve existing mask values
+            host_layer.int_mask_param = nn.Parameter(
+                new_mask, requires_grad=True
+            )
+               
+    if display_print:
+        print(f"  Done: host now has {host_layer.intermediate.dense.out_features} neurons")
