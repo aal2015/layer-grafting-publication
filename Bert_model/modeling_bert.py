@@ -291,7 +291,7 @@ class BertSelfAttention(nn.Module):
             attention_probs = attention_probs * head_mask
 
         context_layer = torch.matmul(attention_probs, value_layer)
-
+        
         # if head_z is not None:       ## cofi paper code
         #     context_layer *= head_z
 
@@ -299,7 +299,9 @@ class BertSelfAttention(nn.Module):
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(new_context_layer_shape)
 
-        outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
+        pre_wo = context_layer
+
+        outputs = (context_layer, attention_probs, pre_wo) if output_attentions else (context_layer,)
 
         if self.is_decoder:
             outputs = outputs + (past_key_value,)
@@ -593,6 +595,7 @@ class BertEncoder(nn.Module):
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_self_attentions_out = () if output_attentions else None
+        all_pre_wo = () if output_attentions else None
         all_inter_out = () if output_hidden_states else None
 
         if self.gradient_checkpointing and self.training:
@@ -675,6 +678,8 @@ class BertEncoder(nn.Module):
             if output_attentions:
                 if len(layer_outputs) > 1: # indicates MHA layer is not pruned
                     all_self_attentions = all_self_attentions + (layer_outputs[1],)
+                    all_pre_wo = all_pre_wo + (layer_outputs[2],)
+                    
                     if self.config.add_cross_attention:
                         all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
                     
@@ -705,7 +710,7 @@ class BertEncoder(nn.Module):
             last_hidden_state=hidden_states,
             past_key_values=next_decoder_cache,
             hidden_states={"hidden_states": all_hidden_states, "inter_out": all_inter_out},
-            attentions={"attention_head": all_self_attentions, "attention_output": all_self_attentions_out},
+            attentions={"attention_head": all_self_attentions, "attention_output": all_self_attentions_out, "pre_wo": all_pre_wo,},
             cross_attentions=all_cross_attentions,
         )
     
