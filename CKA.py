@@ -235,7 +235,7 @@ class CKAEvaluator:
         # return reps_similarity, atts_similarity
         return reps_similarity
 
-    def subLayer_interleaved_pairwise(self, model, dataloader, device, only_cls_token=False, max_iter=float("Inf")):
+    def subLayer_interleaved_pairwise(self, model, dataloader, device, only_cls_token=False, max_iter=float("Inf"), do_sub_out=False):
         """
         Computes a 2N x 2N interleaved CKA similarity matrix.
         Rows/cols ordered as [MHA_1, REP_1, MHA_2, REP_2, ..., MHA_N, REP_N].
@@ -245,10 +245,12 @@ class CKAEvaluator:
         model.set_use_scc_status(False)
     
         n_batch = len(dataloader)
-        reps_similarity = None
-        atts_similarity = None
-        mha_similarity  = None
-        sub_similarity  = None
+        reps_similarity       = None
+        atts_similarity       = None
+        mha_similarity        = None
+        pre_wo_similarity     = None
+        sub_similarity        = None
+        pre_wo_sub_similarity = None
     
         progress_bar = tqdm(range(min(n_batch, max_iter)), desc="CKA Sublayer Evaluation")
     
@@ -265,35 +267,56 @@ class CKAEvaluator:
             reps = output.hidden_states['hidden_states'][1:]
             atts = output.attentions['attention_head']
             mha  = output.attentions['attention_output']
+            pre_wo = output.attentions["pre_wo"]
 
             interleaved = []
-            for mha_layer, rep_layer in zip(mha, reps):
-                interleaved.append(mha_layer)
-                interleaved.append(rep_layer)
-    
-            if sub_similarity is None:
-                reps_similarity = self._pairwise_helper(reps, only_cls_token=only_cls_token)
-                atts_similarity = self._pairwise_helper(atts, is_att=True)
-                mha_similarity  = self._pairwise_helper(mha, only_cls_token=only_cls_token)
-                # sub_similarity  = self._interleaved_pairwise_helper(atts, reps, only_cls_token=only_cls_token)
-                sub_similarity  = self._pairwise_helper(interleaved, only_cls_token=only_cls_token)
+            pre_wo_interleaved = []
+            for mha_layer, rep_layer, pre_wo_layer in zip(mha, reps, pre_wo):
+                if not do_sub_out:
+                    interleaved.append(mha_layer)
+                    interleaved.append(rep_layer)
+                    
+                    pre_wo_interleaved.append(pre_wo_layer)
+                    pre_wo_interleaved.append(mha_layer)
+                else:
+                    pre_wo_interleaved.append(pre_wo_layer)
+                    pre_wo_interleaved.append(mha_layer)
+                    pre_wo_interleaved.append(rep_layer)
+                    
+            if pre_wo_sub_similarity is None:
+                if not do_sub_out:
+                    reps_similarity = self._pairwise_helper(reps, only_cls_token=only_cls_token)
+                    atts_similarity = self._pairwise_helper(atts, is_att=True)
+                    mha_similarity  = self._pairwise_helper(mha, only_cls_token=only_cls_token)
+                    pre_wo_similarity = self._pairwise_helper(pre_wo, only_cls_token=only_cls_token)
+                    # sub_similarity  = self._interleaved_pairwise_helper(atts, reps, only_cls_token=only_cls_token)
+                    sub_similarity  = self._pairwise_helper(interleaved, only_cls_token=only_cls_token)
+                pre_wo_sub_similarity  = self._pairwise_helper(pre_wo_interleaved, only_cls_token=only_cls_token)
             else:
-                reps_similarity += self._pairwise_helper(reps, only_cls_token=only_cls_token)
-                atts_similarity += self._pairwise_helper(atts, is_att=True)
-                mha_similarity  += self._pairwise_helper(mha, only_cls_token=only_cls_token)
-                # sub_similarity  += self._interleaved_pairwise_helper(atts, reps, only_cls_token=only_cls_token)
-                sub_similarity  += self._pairwise_helper(interleaved, only_cls_token=only_cls_token)
+                if not do_sub_out:
+                    reps_similarity += self._pairwise_helper(reps, only_cls_token=only_cls_token)
+                    atts_similarity += self._pairwise_helper(atts, is_att=True)
+                    mha_similarity  += self._pairwise_helper(mha, only_cls_token=only_cls_token)
+                    pre_wo_similarity += self._pairwise_helper(pre_wo, only_cls_token=only_cls_token)
+                    # sub_similarity  += self._interleaved_pairwise_helper(atts, reps, only_cls_token=only_cls_token)
+                    sub_similarity  += self._pairwise_helper(interleaved, only_cls_token=only_cls_token)
+                pre_wo_sub_similarity += self._pairwise_helper(pre_wo_interleaved, only_cls_token=only_cls_token)
     
             progress_bar.update(1)
     
         num_steps = min(n_batch, max_iter)
-        reps_similarity = reps_similarity / num_steps
-        atts_similarity = atts_similarity / num_steps
-        mha_similarity  = mha_similarity / num_steps
-        sub_similarity  = sub_similarity  / num_steps
-    
-        return reps_similarity, atts_similarity, mha_similarity, sub_similarity
+        if not do_sub_out:
+            reps_similarity = reps_similarity / num_steps
+            atts_similarity = atts_similarity / num_steps
+            mha_similarity  = mha_similarity / num_steps
+            pre_wo_similarity  = pre_wo_similarity / num_steps
+            sub_similarity  = sub_similarity  / num_steps
+        pre_wo_sub_similarity  = pre_wo_sub_similarity  / num_steps
 
+        if not do_sub_out:
+            return reps_similarity, atts_similarity, mha_similarity, pre_wo_similarity, sub_similarity, pre_wo_sub_similarity
+        else:
+            return pre_wo_sub_similarity
 
 class SentenceCKARedundancy:
     def __init__(self, device):
