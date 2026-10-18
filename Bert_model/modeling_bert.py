@@ -205,6 +205,7 @@ class BertSelfAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
+        pre_wo_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
@@ -301,6 +302,10 @@ class BertSelfAttention(nn.Module):
 
         pre_wo = context_layer
 
+        # Apply the gate before Wo
+        if pre_wo_mask is not None:
+            context_layer = context_layer * pre_wo_mask
+
         outputs = (context_layer, attention_probs, pre_wo) if output_attentions else (context_layer,)
 
         if self.is_decoder:
@@ -327,12 +332,67 @@ class BertSelfOutput(nn.Module):
         return hidden_states
     
     
+# class BertAttention(nn.Module):
+#     def __init__(self, config, position_embedding_type=None):
+#         super().__init__()
+#         self.self = BertSelfAttention(config, position_embedding_type=position_embedding_type)
+#         self.output = BertSelfOutput(config)
+#         self.pruned_heads = set()
+
+#     def prune_heads(self, heads):
+#         if len(heads) == 0:
+#             return
+#         heads, index = find_pruneable_heads_and_indices(
+#             heads, self.self.num_attention_heads, self.self.attention_head_size, self.pruned_heads
+#         )
+
+#         # Prune linear layers
+#         self.self.query = prune_linear_layer(self.self.query, index)
+#         self.self.key = prune_linear_layer(self.self.key, index)
+#         self.self.value = prune_linear_layer(self.self.value, index)
+#         self.output.dense = prune_linear_layer(self.output.dense, index, dim=1)
+
+#         # Update hyper params and store pruned heads
+#         self.self.num_attention_heads = self.self.num_attention_heads - len(heads)
+#         self.self.all_head_size = self.self.attention_head_size * self.self.num_attention_heads
+#         self.pruned_heads = self.pruned_heads.union(heads)
+
+#     def forward(
+#         self,
+#         hidden_states: torch.Tensor,
+#         attention_mask: Optional[torch.FloatTensor] = None,
+#         head_mask: Optional[torch.FloatTensor] = None,
+#         head_layer_mask: Optional[torch.FloatTensor] = None,
+#         encoder_hidden_states: Optional[torch.FloatTensor] = None,
+#         encoder_attention_mask: Optional[torch.FloatTensor] = None,
+#         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+#         output_attentions: Optional[bool] = False,
+#     ) -> Tuple[torch.Tensor]:
+#         self_outputs = self.self(
+#             hidden_states,
+#             attention_mask,
+#             head_mask,
+#             encoder_hidden_states,
+#             encoder_attention_mask,
+#             past_key_value,
+#             output_attentions,
+#         )
+#         attention_output = self.output(self_outputs[0], hidden_states, head_layer_mask)
+#         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
+#         return outputs
+
 class BertAttention(nn.Module):
     def __init__(self, config, position_embedding_type=None):
         super().__init__()
         self.self = BertSelfAttention(config, position_embedding_type=position_embedding_type)
         self.output = BertSelfOutput(config)
         self.pruned_heads = set()
+
+    def remove_self_attention(self):
+        self.self = None
+
+    def remove_output(self):
+        self.output = None
 
     def prune_heads(self, heads):
         if len(heads) == 0:
@@ -358,24 +418,52 @@ class BertAttention(nn.Module):
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         head_layer_mask: Optional[torch.FloatTensor] = None,
+        pre_wo_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
     ) -> Tuple[torch.Tensor]:
-        self_outputs = self.self(
-            hidden_states,
-            attention_mask,
-            head_mask,
-            encoder_hidden_states,
-            encoder_attention_mask,
-            past_key_value,
-            output_attentions,
-        )
-        attention_output = self.output(self_outputs[0], hidden_states, head_layer_mask)
-        outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
+        self_outputs = None
+        if self.self is not None:
+            self_outputs = self.self(
+                hidden_states,
+                attention_mask,
+                head_mask,
+                pre_wo_mask,
+                encoder_hidden_states,
+                encoder_attention_mask,
+                past_key_value,
+                output_attentions,
+            )
+        
+        if self.output is not None:
+            if self_outputs is not None:
+                attention_output = self.output(
+                    self_outputs[0],
+                    hidden_states,
+                    head_layer_mask,
+                )
+            else:
+                attention_output = hidden_states
+        else:
+            attention_output = (
+                self_outputs[0]
+                if self_outputs is not None
+                else hidden_states
+            )
+        
+        if self_outputs is None:
+            # Self-attention was removed.
+            outputs = (attention_output,)
+        
+            if output_attentions:
+                outputs += (None, None)
+        
+            return outputs
+        
+        outputs = (attention_output,) + self_outputs[1:]
         return outputs
-
 
 class BertIntermediate(nn.Module):
     def __init__(self, config):
@@ -442,6 +530,14 @@ class BertLayer(nn.Module):
     
     def prune_mha_layer(self):
         self.attention = None
+
+    def prune_mha_attention(self):
+        if self.attention is not None:
+            self.attention.remove_self_attention()
+    
+    def prune_mha_wo(self):
+        if self.attention is not None:
+            self.attention.remove_output()
         
     def prune_int_dim(self, keep_dims):
         self.intermediate.dense = prune_linear_layer(self.intermediate.dense, index=torch.LongTensor(keep_dims), dim=0)
@@ -455,6 +551,7 @@ class BertLayer(nn.Module):
         mlp_mask: Optional[torch.FloatTensor] = None,
         int_mask: Optional[torch.Tensor] = None,
         head_layer_mask: Optional[torch.FloatTensor] = None,
+        pre_wo_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
@@ -482,6 +579,7 @@ class BertLayer(nn.Module):
                 attention_mask,
                 head_mask,
                 head_layer_mask,
+                pre_wo_mask,
                 output_attentions=output_attentions,
                 past_key_value=self_attn_past_key_value,
             )
@@ -582,6 +680,7 @@ class BertEncoder(nn.Module):
         head_mask: Optional[torch.FloatTensor] = None,
         mlp_mask: Optional[torch.FloatTensor] = None,
         int_mask: Optional[torch.Tensor] = None,
+        pre_wo_mask: Optional[torch.FloatTensor] = None,
         head_layer_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
@@ -655,6 +754,7 @@ class BertEncoder(nn.Module):
                     mlp_mask[i],
                     layer_int_mask,
                     head_layer_mask[i] if head_layer_mask is not None else None,
+                    pre_wo_mask[i] if pre_wo_mask is not None else None,
                     encoder_hidden_states,
                     encoder_attention_mask,
                 )
@@ -666,6 +766,7 @@ class BertEncoder(nn.Module):
                     mlp_mask[i],
                     int_mask[i] if int_mask is not None else None,
                     head_layer_mask[i] if head_layer_mask is not None else None,
+                    pre_wo_mask[i] if pre_wo_mask is not None else None,
                     encoder_hidden_states,
                     encoder_attention_mask,
                     past_key_value,
@@ -838,6 +939,7 @@ class BertModel(BertPreTrainedModel):
         head_mask: Optional[torch.Tensor] = None,
         mlp_mask: Optional[torch.Tensor] = None,
         int_mask: Optional[torch.Tensor] = None,
+        pre_wo_mask: Optional[torch.Tensor] = None,
         head_layer_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
@@ -948,6 +1050,7 @@ class BertModel(BertPreTrainedModel):
             head_mask=head_mask,
             mlp_mask=mlp_mask,
             int_mask=int_mask,
+            pre_wo_mask=pre_wo_mask,
             head_layer_mask=head_layer_mask,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_extended_attention_mask,
@@ -1009,6 +1112,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
         head_layer_mask: Optional[torch.Tensor] = None,
         mlp_mask: Optional[torch.Tensor] = None,
         int_mask: Optional[torch.Tensor] = None,
+        pre_wo_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
@@ -1030,7 +1134,8 @@ class BertForSequenceClassification(BertPreTrainedModel):
             position_ids=position_ids,
             head_mask=head_mask,
             mlp_mask=mlp_mask,
-            int_mask = int_mask,
+            int_mask=int_mask,
+            pre_wo_mask=pre_wo_mask,
             head_layer_mask=head_layer_mask,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
