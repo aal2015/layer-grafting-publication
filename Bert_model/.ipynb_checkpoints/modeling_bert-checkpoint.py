@@ -521,6 +521,7 @@ class BertLayer(nn.Module):
         self.output = BertOutput(config)
         self.int_mask_param = None
         self.head_mask_param = None
+        self.pre_wo_mask = None
         self.head_layer_mask_param = None
         self.mlp_mask = None
         
@@ -570,6 +571,9 @@ class BertLayer(nn.Module):
 
         if self.mlp_mask != None:
             mlp_mask = self.mlp_mask
+
+        if self.pre_wo_mask != None:
+            pre_wo_mask = self.pre_wo_mask
             
         if self.attention is not None:
             # decoder uni-directional self-attention cached key/values tuple is at positions 1,2

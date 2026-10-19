@@ -6,8 +6,9 @@ import matplotlib.pyplot as plt
 from train_eval_func import get_primary_metric, eval_loop
 
 def register_importance_masks(model, device, 
-                          register_mha=True, register_mlp=True,
-                          register_mha_layer=True, register_mlp_layer=True):
+                          register_mha=False, register_mlp=False,
+                          register_mha_layer=False, register_mlp_layer=False, 
+                              register_pre_wo_layer=False):
     """
     Register importance masks for MHA and/or FFN at two granularities:
     
@@ -27,7 +28,7 @@ def register_importance_masks(model, device,
         register_mha_layer: register scalar MHA layer gate (head_layer_mask_param)
         register_mlp_layer: register scalar FFN layer gate (mlp_mask)
     """
-    if not any([register_mha, register_mlp, register_mha_layer, register_mlp_layer]):
+    if not any([register_pre_wo_layer, register_mha, register_mlp, register_mha_layer, register_mlp_layer]):
         raise ValueError("Must register at least one mask type")
 
     for layer_idx, layer in enumerate(model.bert.encoder.layer):
@@ -78,6 +79,17 @@ def register_importance_masks(model, device,
                     requires_grad=True
                 )
                 parts.append("FFN layer gate")
+
+        # --- layer-level: scalar pre-WO gate ---
+        if register_pre_wo_layer:
+            if layer.attention is None or layer.attention.self is None:
+                print(f"  Layer {layer_idx}: MHA attention pruned, skipping pre_wo_mask")
+            else:
+                layer.pre_wo_mask = nn.Parameter(
+                    torch.ones(1, dtype=torch.float32, device=device),
+                    requires_grad=True
+                )
+                parts.append("pre-WO layer gate")
 
         print(f"  Layer {layer_idx}: Registered ({', '.join(parts)})")
 
@@ -420,6 +432,7 @@ def compute_layer_importance_scores(
     compute_ffn: bool = True,
     compute_heads: bool = False,
     compute_neurons: bool = False,
+    compute_pre_wo: bool = False,
     display_separate: bool = True,
     display_combined: bool = True,
     display_pruning_order: bool = True,
@@ -481,13 +494,22 @@ def compute_layer_importance_scores(
             display_pruning_order=False
         )
     """
-    if not any([compute_mha, compute_ffn, compute_heads, compute_neurons]):
+    if not any([compute_pre_wo, compute_mha, compute_ffn, compute_heads, compute_neurons]):
         raise ValueError("Must compute at least one importance type")
 
     n_layers = len(model.bert.encoder.layer)
 
     # --- validate registered masks ---
     for layer_idx, layer in enumerate(model.bert.encoder.layer):
+        if compute_pre_wo and layer.attention is not None:
+            if layer.attention.self is not None and not isinstance(
+                layer.pre_wo_mask, nn.Parameter
+            ):
+                raise ValueError(
+                    f"Layer {layer_idx}: pre_wo_mask not registered. "
+                    f"Call register_importance_masks(..., "
+                    f"register_pre_wo_layer=True) first."
+                )
         if compute_mha and layer.attention is not None:
             if not isinstance(layer.head_layer_mask_param, nn.Parameter):
                 raise ValueError(
@@ -514,8 +536,9 @@ def compute_layer_importance_scores(
                 )
 
     # --- initialize accumulators ---
-    mha_importance    = torch.zeros(n_layers) if compute_mha     else None
-    ffn_importance    = torch.zeros(n_layers) if compute_ffn     else None
+    pre_wo_importance = (torch.zeros(n_layers) if compute_pre_wo else None)
+    mha_importance    = torch.zeros(n_layers) if compute_mha else None
+    ffn_importance    = torch.zeros(n_layers) if compute_ffn else None
     head_importance   = None
     neuron_importance = None
 
@@ -537,6 +560,7 @@ def compute_layer_importance_scores(
 
     # --- describe what we're computing ---
     active = []
+    if compute_pre_wo:  active.append("pre-WO layer")
     if compute_mha:     active.append("MHA layer")
     if compute_ffn:     active.append("FFN layer")
     if compute_heads:   active.append("heads")
@@ -557,6 +581,13 @@ def compute_layer_importance_scores(
         outputs.loss.backward()
 
         for layer_idx, layer in enumerate(model.bert.encoder.layer):
+            if (
+                compute_pre_wo
+                and layer.attention is not None
+                and layer.attention.self is not None
+            ):
+                if layer.pre_wo_mask.grad is not None:
+                    pre_wo_importance[layer_idx] += layer.pre_wo_mask.grad.abs().item()
             if compute_mha and layer.attention is not None:
                 if layer.head_layer_mask_param.grad is not None:
                     mha_importance[layer_idx] += layer.head_layer_mask_param.grad.abs().item()
@@ -579,6 +610,15 @@ def compute_layer_importance_scores(
     # --- normalize by tokens → raw absolute sensitivity ---
     mha_importance_raw = None
     ffn_importance_raw = None
+    ffn_importance_raw = None
+
+    if compute_pre_wo:
+        pre_wo_importance /= tot_tokens
+        pre_wo_importance_raw = pre_wo_importance.clone().numpy()
+        pre_wo_importance = (
+            pre_wo_importance
+            / pre_wo_importance.max().clamp(min=1e-8)
+        ).numpy()
 
     if compute_mha:
         mha_importance    /= tot_tokens
@@ -601,19 +641,26 @@ def compute_layer_importance_scores(
             if neuron_importance[layer_idx] is not None:
                 neuron_importance[layer_idx] /= tot_tokens
 
-    # --- combined sublayer importance ---
+     # --- combined sublayer importance ---
     sublayer_importance = None
-    if compute_mha and compute_ffn:
-        combined_raw = np.zeros(n_layers * 2)
+
+    if compute_pre_wo and compute_mha and compute_ffn:
+        combined_raw = np.zeros(n_layers * 3)
+
         for i in range(n_layers):
-            combined_raw[i * 2]     = mha_importance_raw[i]
-            combined_raw[i * 2 + 1] = ffn_importance_raw[i]
-        sublayer_importance = combined_raw / combined_raw.max().clip(min=1e-8)
+            combined_raw[i * 3]     = pre_wo_importance_raw[i]
+            combined_raw[i * 3 + 1] = mha_importance_raw[i]
+            combined_raw[i * 3 + 2] = ffn_importance_raw[i]
+
+        sublayer_importance = (
+            combined_raw / max(combined_raw.max(), 1e-8)
+        )
 
     # --- separate display ---
     if display_separate:
         print("\nLayer Importance Summary (separate):")
         header_parts = ["Layer"]
+        if compute_pre_wo:  header_parts.append("Pre-WO(layer)")
         if compute_mha:     header_parts.append("MHA(layer)")
         if compute_ffn:     header_parts.append("FFN(layer)")
         if compute_heads:   header_parts.append("Heads(mean)")
@@ -622,6 +669,8 @@ def compute_layer_importance_scores(
         print(f"  {'-' * (15 * len(header_parts))}")
         for i in range(n_layers):
             row = [f"{i:<13}"]
+            if compute_pre_wo:
+                row.append(f"{pre_wo_importance[i]:>13.4f}")
             if compute_mha:
                 row.append(f"{mha_importance[i]:>13.4f}")
             if compute_ffn:
@@ -637,23 +686,38 @@ def compute_layer_importance_scores(
         print("\nSublayer Importance Summary (combined, raw-normalized):")
         print(f"  {'Sublayer':<12} {'Type':<8} {'Layer':<8} {'Score':>10}")
         print(f"  {'-' * 40}")
-        for k in range(n_layers * 2):
-            layer_idx = k // 2
-            stype     = "MHA" if k % 2 == 0 else "FFN"
-            score     = sublayer_importance[k]
-            label     = f"{stype}_{layer_idx}"
-            print(f"  {label:<12} {stype:<8} {layer_idx:<8} {score:>10.4f}")
+        for k in range(n_layers * 3):
+            layer_idx = k // 3
+            stype = ["Pre-WO", "MHA", "MLP"][k % 3]
+            score = sublayer_importance[k]
+            label = f"{stype}_{layer_idx}"
+
+            print(
+                f"  {label:<12} {stype:<8} "
+                f"{layer_idx:<8} {score:>10.4f}"
+            )
 
         if display_pruning_order:
             print("\n  Pruning order (lowest → highest importance):")
             pruning_order = np.argsort(sublayer_importance)
-            for rank, k in enumerate(pruning_order):
-                layer_idx = k // 2
-                stype     = "MHA" if k % 2 == 0 else "FFN"
-                print(f"    Rank {rank+1:>2}: {stype}_L{layer_idx} "
-                      f"score={sublayer_importance[k]:.4f}")
 
-    return mha_importance, ffn_importance, head_importance, neuron_importance, sublayer_importance
+            for rank, k in enumerate(pruning_order):
+                layer_idx = k // 3
+                stype = ["Pre-WO", "MHA", "MLP"][k % 3]
+
+                print(
+                    f"    Rank {rank+1:>2}: {stype}_L{layer_idx} "
+                    f"score={sublayer_importance[k]:.4f}"
+                )
+
+        return (
+            pre_wo_importance,
+            mha_importance,
+            ffn_importance,
+            head_importance,
+            neuron_importance,
+            sublayer_importance,
+        )
 
 def remaining_layers_stat(model, component='head'):
     stats = []
