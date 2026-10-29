@@ -86,10 +86,17 @@ def merge_bert_layers(model, layer1_idx, layer2_idx,
     merged_layer.attention.output.dense.weight.data = merged_output_weight
     
     # Bias: average (both contribute to same output space, so averaging is OK here)
+    # if layer1.attention.output.dense.bias is not None:
+    #     merged_layer.attention.output.dense.bias.data = (
+    #         layer1.attention.output.dense.bias + layer2.attention.output.dense.bias
+    #     ) / 2
+
+    # Bias: addition instead of average
     if layer1.attention.output.dense.bias is not None:
         merged_layer.attention.output.dense.bias.data = (
-            layer1.attention.output.dense.bias + layer2.attention.output.dense.bias
-        ) / 2
+        layer1.attention.output.dense.bias +
+        layer2.attention.output.dense.bias
+    )
     
     # ─────────────────────────────────────────────────────────────────────────
     # CRITICAL: Merge attention output LayerNorm
@@ -164,9 +171,13 @@ def merge_bert_layers(model, layer1_idx, layer2_idx,
     merged_layer.output.dense.weight.data = merged_ffn_output_weight
     
     if layer1.output.dense.bias is not None:
+        # merged_layer.output.dense.bias.data = (
+        #     layer1.output.dense.bias + layer2.output.dense.bias
+        # ) / 2
         merged_layer.output.dense.bias.data = (
-            layer1.output.dense.bias + layer2.output.dense.bias
-        ) / 2
+            layer1.output.dense.bias +
+            layer2.output.dense.bias
+        )
     
     # ─────────────────────────────────────────────────────────────────────────
     # CRITICAL: Merge FFN output LayerNorm (same strategy as attention LN)
