@@ -61,7 +61,7 @@ import torch
         
 #     return metric.compute(), float(model_loss)
 
-def eval_loop(model, dataloader, dataset, device, benchmark="glue", regression=False):
+def eval_loop(model, dataloader, dataset, device, benchmark="glue", regression=False, run_layer=None):
     metric = evaluate.load(benchmark, dataset)
     model.eval()
     
@@ -71,7 +71,10 @@ def eval_loop(model, dataloader, dataset, device, benchmark="glue", regression=F
     for batch in dataloader:
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
-            outputs = model(**batch)
+            if run_layer:
+                outputs = model(**batch, run_layer=run_layer)
+            else:
+                outputs = model(**batch)
         
         loss = outputs.loss
         logits = outputs.logits
@@ -119,7 +122,8 @@ def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs
           lr=3e-5, patience=3, threshold=0.0, save_path=None, optimizer=None, 
           lr_scheduler=None, use_early_stopping=False, display_epoch_iter=False,
           max_norm=0.05, benchmark="glue", regression=False, teacher_model=None, alpha=0.5, 
-          temperature=6, student_layer_ids=None, teacher_layer_ids=None, gamma=0.3):
+          temperature=6, student_layer_ids=None, teacher_layer_ids=None, gamma=0.3, 
+          run_layer=None):
     """
     Train BERT model with optional early stopping and checkpoint saving.
     Automatically handles all GLUE task metrics.
@@ -194,7 +198,10 @@ def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs
             batch = {k: v.to(device) for k, v in batch.items()}
             
             # Forward pass
-            outputs = model(**batch)
+            if run_layer:
+                outputs = model(**batch, run_layer=run_layer)
+            else:
+                outputs = model(**batch)
             loss = outputs.loss
             logits = outputs.logits
 
@@ -253,7 +260,7 @@ def train(model, train_dataloader, val_dataloader, task_name, device, num_epochs
         
         # Validation
         val_metrics, val_loss = eval_loop(
-            model, val_dataloader, task_name, device, benchmark, regression=regression
+            model, val_dataloader, task_name, device, benchmark, regression=regression, run_layer=run_layer
         )
         
         # Store history

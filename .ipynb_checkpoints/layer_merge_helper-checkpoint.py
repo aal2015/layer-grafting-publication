@@ -205,51 +205,81 @@ def merge_high_sim_layer_composition(layer_composition, sublayer_imp, reps_simil
 #### Merge Functions
 import torch.nn as nn
 
-def resize_qkv(linear_layer, new_out_dim):
-    new_layer = nn.Linear(
-        in_features=linear_layer.in_features,
-        out_features=new_out_dim,
-        bias=True
-    ).to(linear_layer.weight.device)
+# def resize_qkv(linear_layer, new_out_dim):
+#     new_layer = nn.Linear(
+#         in_features=linear_layer.in_features,
+#         out_features=new_out_dim,
+#         bias=True
+#     ).to(linear_layer.weight.device)
 
-    return new_layer
+#     return new_layer
+
+# def resize_output(linear_layer, new_in_dim):
+#     new_layer = nn.Linear(
+#         in_features=new_in_dim,
+#         out_features=linear_layer.out_features,
+#         bias=True
+#     ).to(linear_layer.weight.device)
+
+#     return new_layer
+
+def resize_qkv(linear_layer, new_out_dim):
+    old = linear_layer
+    new = nn.Linear(old.in_features, new_out_dim, bias=old.bias is not None,
+                    device=old.weight.device, dtype=old.weight.dtype)
+    with torch.no_grad():
+        n = old.out_features
+        new.weight[:n] = old.weight
+        if old.bias is not None:
+            new.bias[:n] = old.bias
+    return new
 
 def resize_output(linear_layer, new_in_dim):
-    new_layer = nn.Linear(
-        in_features=new_in_dim,
-        out_features=linear_layer.out_features,
-        bias=True
-    ).to(linear_layer.weight.device)
-
-    return new_layer
-
-def cw_helper(sourceLinearLayer, targetLinearLayer, s_len, t_len, dim=0):
+    old = linear_layer
+    new = nn.Linear(new_in_dim, old.out_features, bias=old.bias is not None,
+                    device=old.weight.device, dtype=old.weight.dtype)
     with torch.no_grad():
+        n = old.in_features
+        new.weight[:, :n] = old.weight
+        if old.bias is not None:
+            new.bias.copy_(old.bias)      # output bias belongs to target
+    return new
 
+# def cw_helper(sourceLinearLayer, targetLinearLayer, s_len, t_len, dim=0):
+#     with torch.no_grad():
+
+#         if dim == 0:
+#             # Row-wise (Q, K, V)
+#             W_source = sourceLinearLayer.weight.data[:s_len]
+#             W_target = targetLinearLayer.weight.data[:t_len]
+
+#             b_source = sourceLinearLayer.bias.data[:s_len]
+#             b_target = targetLinearLayer.bias.data[:t_len]
+
+#             new_W = torch.cat([W_target, W_source], dim=0)
+#             new_b = torch.cat([b_target, b_source], dim=0)
+
+#             targetLinearLayer.weight.data[:t_len + s_len] = new_W
+#             targetLinearLayer.bias.data[:t_len + s_len] = new_b
+
+#         else:
+#             # Column-wise (output projection)
+#             W_source = sourceLinearLayer.weight.data[:, :s_len]
+#             W_target = targetLinearLayer.weight.data[:, :t_len]
+
+#             new_W = torch.cat([W_target, W_source], dim=1)
+
+#             targetLinearLayer.weight.data[:, :t_len + s_len] = new_W
+
+#             # Bias unchanged (correct for output layer)
+
+def cw_helper(src, tgt, s_len, t_len, dim=0):
+    with torch.no_grad():
         if dim == 0:
-            # Row-wise (Q, K, V)
-            W_source = sourceLinearLayer.weight.data[:s_len]
-            W_target = targetLinearLayer.weight.data[:t_len]
-
-            b_source = sourceLinearLayer.bias.data[:s_len]
-            b_target = targetLinearLayer.bias.data[:t_len]
-
-            new_W = torch.cat([W_target, W_source], dim=0)
-            new_b = torch.cat([b_target, b_source], dim=0)
-
-            targetLinearLayer.weight.data[:t_len + s_len] = new_W
-            targetLinearLayer.bias.data[:t_len + s_len] = new_b
-
+            tgt.weight[t_len:t_len + s_len] = src.weight[:s_len]
+            tgt.bias[t_len:t_len + s_len]   = src.bias[:s_len]
         else:
-            # Column-wise (output projection)
-            W_source = sourceLinearLayer.weight.data[:, :s_len]
-            W_target = targetLinearLayer.weight.data[:, :t_len]
-
-            new_W = torch.cat([W_target, W_source], dim=1)
-
-            targetLinearLayer.weight.data[:, :t_len + s_len] = new_W
-
-            # Bias unchanged (correct for output layer)
+            tgt.weight[:, t_len:t_len + s_len] = src.weight[:, :s_len]
 
 def merge_mha(model, sourceLayer, targetLayer,
               source_head_imp_sorted, target_head_imp_sorted,
